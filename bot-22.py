@@ -71,10 +71,16 @@ TOKEN = _find_bot_token()
 # чтобы ты мог узнать ID командой /id). После — впиши сюда число и перезапусти.
 ALLOWED_CHAT_ID = -1003256279775
 
-# Папка для данных. Приоритет: DATA_DIR → SHARED_DIR (постоянное хранилище bothost) →
-# /app/data → текущая папка. Постоянное хранилище переживает редеплой (не теряются LP/статистика).
-DATA_DIR = (os.getenv("DATA_DIR") or os.getenv("SHARED_DIR")
-            or ("/app/data" if os.path.isdir("/app/data") else "."))
+# Папка для данных (база переживает редеплой только в постоянном хранилище bothost).
+# Приоритет: DATA_DIR → SHARED_DIR → /app/shared (общее хранилище bothost) → /app/data → текущая папка.
+DATA_DIR = os.getenv("DATA_DIR") or os.getenv("SHARED_DIR") or ""
+if not DATA_DIR:
+    for _p in ("/app/shared", "/app/data"):
+        if os.path.isdir(_p):
+            DATA_DIR = _p
+            break
+    else:
+        DATA_DIR = "."
 try:
     os.makedirs(DATA_DIR, exist_ok=True)
 except Exception:
