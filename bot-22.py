@@ -116,6 +116,11 @@ RAID_JOIN_COUNT = 5
 RAID_WINDOW = 60
 RAID_LOCKDOWN_MIN = 10
 
+# Префикс команд: в ЧАТЕ бот реагирует ТОЛЬКО на сообщения, начинающиеся с этого символа
+# (.help, .profile, .Linkor ...). Обычные сообщения без точки командой не считаются — так бот
+# не сработает случайно (например, от слова «linkor» в обычной речи). В личке точка необязательна.
+CMD_PREFIX = "."
+
 # Команды участников, недоступные без принятого соглашения (faq/terms/help оставляем свободными).
 GATED_COMMANDS = {
     "profile", "prof", "proff", "top", "shop", "store", "norms", "rules", "docs",
@@ -240,9 +245,10 @@ CHANGELOG_HISTORY = [
         "🔇 Длительность мута можно писать удобно: «30м» (минуты), «12ч» (часы), «7д» (дни) — не только в минутах.",
         "🎮 Привязка тега стала защищённой: тег должен состоять в клубе LINKOR, а игровой ник — совпадать с твоей припиской «LT | ник» в чате. Чужой профиль привязать больше нельзя.",
         "👤 В профиле вместо неточной даты вступления теперь рекорд серии дней.",
-        "🏅 В профиле Brawl Stars появилась лига (по кубкам): от Новичка до Мастера.",
         "👑 Зал славы прокачан: теперь это топы по LP, сообщениям, репутации и кубкам — соревнуйтесь за место среди легенд клана.",
         "📋 До старта норм (22 июня) нормы больше не показываются в профиле и не начисляют LP — всё включится одновременно.",
+        "❓ Справка (help) стала кнопочным меню: разделы (профиль, клан, игры, AI, админ) открываются прямо в том же сообщении и сворачиваются — больше никакой стены текста на пол-чата.",
+        "⌨️ Команды теперь с точкой в начале: <code>.help</code>, <code>.profile</code>, <code>.Linkor вопрос</code>. Слово без точки командой не считается — бот больше не срабатывает случайно (например, от «linkor» в обычной речи). В личке точка необязательна.",
     ]),
     ("5.0", "глобальное обновление", [
         "🎉 В честь запуска «Цитадели» и за терпение во время техработ — всем участникам разовый бонус +150 LP!",
@@ -349,18 +355,8 @@ BRAWL_API_BASE = "https://bsproxy.royaleapi.dev/v1"   # прокси RoyaleAPI (
 BRAWL_CACHE_TTL = 600              # сколько секунд держать данные игрока в памяти
 LINKOR_CLUB_TAG = "2U80CYP9J"      # тег клуба LINKOR (без #): тег можно привязать только если игрок состоит в клубе
 TAG_VERIFY_BY_TITLE = True         # дополнительно сверять игровой ник с припиской «LT | ник» в чате
-# Лиги по суммарным кубкам (Brawl-API не отдаёт ранговую лигу напрямую, поэтому считаем по кубкам).
-# Пороги можно подстроить под свой клан. Норма ранга в регламенте — «Легендарная».
-LEAGUE_TIERS = [
-    (50000, "Мастер", "cup"),
-    (35000, "Легендарная", "crown"),
-    (25000, "Мифическая", "fire"),
-    (18000, "Алмазная", "star"),
-    (12000, "Золотая", "gold"),
-    (6000, "Серебряная", "silver"),
-    (2000, "Бронзовая", "bronze"),
-    (0, "Новичок", "shield"),
-]
+# Примечание: Brawl-API не отдаёт ранговую лигу (Ranked) — её норму («Легендарная») проверяют вручную
+# командой «норма ранг». Бот автоматически следит только за приростом кубков (норма кубков).
 
 # Московское время (UTC+3, без перевода часов)
 MSK = timezone(timedelta(hours=3))
@@ -1040,22 +1036,12 @@ def brawl_profile_line(chat_id, user_id):
     data = brawl_cached(tag)
     trophies = data.get("trophies", 0) if data else (row["brawl_trophies"] if (row and "brawl_trophies" in row.keys()) else 0)
     highest = data.get("highestTrophies", 0) if data else 0
-    lname, lemoji = league_label(trophies)
     line = (f"\n\n<blockquote>{pe('game')} <b>Brawl Stars</b> · #{esc(tag)}\n"
             f"{pe('cup')} Кубки: <b>{fmt_num(trophies)}</b>")
     if highest:
         line += f" · рекорд <b>{fmt_num(highest)}</b>"
-    line += f"\n{pe(lemoji)} Лига: <b>{lname}</b></blockquote>"
+    line += "</blockquote>"
     return line
-
-
-def league_label(trophies):
-    """Лига по суммарным кубкам -> (название, ключ премиум-эмодзи)."""
-    t = int(trophies or 0)
-    for thr, name, emoji in LEAGUE_TIERS:
-        if t >= thr:
-            return name, emoji
-    return "Новичок", "shield"
 
 
 def brawl_card(data, tag, bound=False):
@@ -1063,14 +1049,12 @@ def brawl_card(data, tag, bound=False):
     club = data.get("club") or {}
     club_name = esc(club.get("name")) if club.get("name") else "—"
     head = f"{pe('check')} <b>Тег привязан!</b>" if bound else f"{pe('game')} <b>ПРОФИЛЬ BRAWL STARS</b>"
-    lname, lemoji = league_label(data.get("trophies", 0))
     norm_note = (f"\n<i>Следи за нормой клана: прирост +{WEEKLY_TROPHY_NORM} кубков в неделю.</i>"
                  if today_str() >= NORMS_START_DATE else "")
     return (f"{head}\n{CLAN_LINE}\n"
             f"{pe('game')} <b>{name}</b> · #{esc(tag)}\n"
             f"<blockquote>{pe('cup')} Кубки: <b>{fmt_num(data.get('trophies', 0))}</b>\n"
             f"{pe('star')} Рекорд кубков: <b>{fmt_num(data.get('highestTrophies', 0))}</b>\n"
-            f"{pe(lemoji)} Лига: <b>{lname}</b>\n"
             f"{pe('crown')} Уровень: <b>{data.get('expLevel', '?')}</b>\n"
             f"{pe('shield')} Клуб: <b>{club_name}</b></blockquote>{norm_note}")
 
@@ -1109,7 +1093,7 @@ async def cmd_brawl(update, context, parts):
         tag = parts[1].strip().upper().lstrip("#")
         if not BRAWL_TAG_RE.fullmatch(tag):
             await update.message.reply_text(
-                "Похоже, тег неверный. Пример: <code>tag #2PP0LC</code> — тег виден в профиле игры под именем.",
+                "Похоже, тег неверный. Пример: <code>.tag #2PP0LC</code> — тег виден в профиле игры под именем.",
                 parse_mode=ParseMode.HTML)
             return True
         await context.bot.send_chat_action(chat_id, "typing")
@@ -1150,7 +1134,7 @@ async def cmd_brawl(update, context, parts):
     tag = row["brawl_tag"] if (row and "brawl_tag" in row.keys()) else None
     if not tag:
         await update.message.reply_text(
-            f"{pe('game')} У тебя не привязан игровой тег. Привяжи: <code>tag #ТВОЙТЕГ</code> "
+            f"{pe('game')} У тебя не привязан игровой тег. Привяжи: <code>.tag #ТВОЙТЕГ</code> "
             f"(тег виден в профиле Brawl Stars под именем).", parse_mode=ParseMode.HTML)
         return True
     await context.bot.send_chat_action(chat_id, "typing")
@@ -1396,7 +1380,7 @@ async def check_tag_gate(update, context, user):
     else:
         try:
             await update.message.reply_text(
-                f"{pe('warn')} {mention(user)}, привяжи игровой тег: <code>tag #ТВОЙ_ТЕГ</code>. "
+                f"{pe('warn')} {mention(user)}, привяжи игровой тег: <code>.tag #ТВОЙ_ТЕГ</code>. "
                 f"Это обязательно. Тег-варн <b>{n}/3</b> — на 3-й день без тега будет авто-исключение.",
                 parse_mode=ParseMode.HTML)
         except Exception:
@@ -1646,7 +1630,7 @@ async def show_top(update, context, args):
     if not rows:
         if cat == "trophies":
             return await update.message.reply_text(
-                f"{pe('game')} Пока ни у кого не привязан тег или нет данных по кубкам. Привяжите тег: <code>tag #ТЕГ</code>.",
+                f"{pe('game')} Пока ни у кого не привязан тег или нет данных по кубкам. Привяжите тег: <code>.tag #ТЕГ</code>.",
                 parse_mode=ParseMode.HTML)
         return await update.message.reply_text("Пока нет данных для этого топа.")
     lines = [f"{pe('cup')} <b>ТОП {CLAN_NAME} — {label}</b>\n"]
@@ -1766,7 +1750,7 @@ def main_menu_keyboard(owner_id):
          InlineKeyboardButton("👑 Зал славы", callback_data=f"menu:hof:{u}")],
         [InlineKeyboardButton("📋 Нормы", callback_data=f"menu:norms:{u}"),
          InlineKeyboardButton("📜 Правила", callback_data=f"menu:rules:{u}")],
-        [InlineKeyboardButton("❓ Помощь", callback_data=f"menu:help:{u}")],
+        [InlineKeyboardButton("❓ Помощь", callback_data=f"help:menu:{u}")],
     ])
 
 
@@ -2085,7 +2069,7 @@ async def on_action_callback(update, context):
             try:
                 await cq.edit_message_text(
                     f"{pe('check')} <b>Соглашение принято.</b> Теперь бот тебе полностью доступен.\n"
-                    f"Не забудь привязать игровой тег: <code>tag #ТВОЙ_ТЕГ</code>. Удачи в клане {CLAN_NAME}! {pe('fire')}",
+                    f"Не забудь привязать игровой тег: <code>.tag #ТВОЙ_ТЕГ</code>. Удачи в клане {CLAN_NAME}! {pe('fire')}",
                     parse_mode=ParseMode.HTML)
             except Exception:
                 try:
@@ -2207,6 +2191,28 @@ async def on_action_callback(update, context):
             await cq.edit_message_text(cap["text"] or "—", parse_mode=ParseMode.HTML, reply_markup=kb)
         except Exception as e:
             print(f"[MENU] не удалось показать раздел {action}: {e}", flush=True)
+        return
+
+    # ----- КНОПОЧНАЯ СПРАВКА (help:) -----
+    if data.startswith("help:"):
+        parts = data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        owner_id = int(parts[2]) if len(parts) > 2 and parts[2].lstrip("-").isdigit() else user.id
+        if user.id != owner_id:
+            return await cq.answer("Эту справку открыл другой игрок. Открой свою — напиши: help", show_alert=True)
+        await cq.answer()
+        if action in ("menu", "back"):
+            try:
+                await cq.edit_message_text(_help_intro(), parse_mode=ParseMode.HTML,
+                                           reply_markup=help_menu_keyboard(owner_id))
+            except Exception:
+                pass
+            return
+        back = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"help:menu:{owner_id}")]])
+        try:
+            await cq.edit_message_text(_help_section(action), parse_mode=ParseMode.HTML, reply_markup=back)
+        except Exception as e:
+            print(f"[HELP] не удалось показать раздел {action}: {e}", flush=True)
         return
 
     # ----- ПОКУПКА (резерв LP + заявка менеджеру) -----
@@ -2496,6 +2502,9 @@ async def private_router(update, context):
     if not user:
         return
     text = (update.message.text or "").strip()
+    # В личке точка-префикс необязательна: если человек написал «.profile» — срежем точку и поймём как «profile».
+    if CMD_PREFIX and len(text) > 1 and text.startswith(CMD_PREFIX) and not text.startswith(CMD_PREFIX * 2):
+        text = text[len(CMD_PREFIX):].strip()
     low = text.lower()
     is_creator = user.id in CONTEST_CREATORS
     gw_state = context.user_data.get("gw_state")
@@ -3694,11 +3703,15 @@ async def text_router(update, context):
     msg = update.message
     if not msg or not msg.text:
         return
-    text = msg.text.strip()
-    low = text.lower()
-    parts = low.split()
-    if parts and await handle_triggers(update, context, text, low, parts):
-        return
+    raw = msg.text.strip()
+    # В чате команды срабатывают ТОЛЬКО с префиксом-точкой (.help, .profile, .Linkor ...).
+    # Сообщения без точки — обычная речь: командой не считаются (но в статистике/LP учитываются отдельно).
+    if CMD_PREFIX and raw.startswith(CMD_PREFIX):
+        text = raw[len(CMD_PREFIX):].strip()
+        low = text.lower()
+        parts = low.split()
+        if parts and await handle_triggers(update, context, text, low, parts):
+            return
     await auto_moderate(update, context)
 
 
@@ -3739,7 +3752,7 @@ async def welcome(update, context):
             f"Рады видеть тебя, {mention(member)} {pe('hug')}\n\n"
             f"{pe('excl')} <b>Два обязательных шага:</b>\n"
             f"<blockquote>1. Прими соглашение — кнопка ниже (открой бота в ЛС).\n"
-            f"2. Привяжи игровой тег: <code>tag #ТВОЙ_ТЕГ</code> (на это есть 3 дня, иначе авто-исключение).</blockquote>\n"
+            f"2. Привяжи игровой тег: <code>.tag #ТВОЙ_ТЕГ</code> (на это есть 3 дня, иначе авто-исключение).</blockquote>\n"
             f"<blockquote>{pe('scroll')} <b>rules</b> — кодекс · {pe('excl')} <b>norms</b> — нормы кубков\n"
             f"{pe('person')} <b>profile</b> · {pe('shop')} <b>shop</b> · {pe('robot')} <b>help</b></blockquote>\n"
             f"Общайся в чате — за сообщения капают {pe('lp')} LP. С 22 июня действует норма кубков (+1450/нед). "
@@ -3762,7 +3775,7 @@ async def start_cmd(update, context):
         f"{pe('crown')} <b>Официальный бот клана {CLAN_NAME}</b>\n"
         f"Модерация · статистика · LP · конкурсы · игры · AI\n\n"
         f"{pe('check')} Соглашение уже принято — бот тебе полностью доступен.\n"
-        f"В личке: <b>profile</b> · <b>appeal</b> · <b>faq</b> · <b>help</b>", parse_mode=ParseMode.HTML)
+        f"В личке: <code>.profile</code> · <code>.appeal</code> · <code>.faq</code> · <code>.help</code>", parse_mode=ParseMode.HTML)
 
 
 async def id_cmd(update, context):
@@ -3781,7 +3794,7 @@ def _help_member_text():
         f"{pe('person')} <b>Профиль и статистика</b>\n"
         "• <code>profile</code> (свой), <code>profile @юзер</code> или ответом — чужой\n"
         "• <code>lp</code> — твой баланс · <code>+</code> (ответом) — репутация\n"
-        f"• <code>tag #ТВОЙТЕГ</code> — привязать профиль Brawl Stars {pe('game')}\n"
+        f"• <code>.tag #ТВОЙТЕГ</code> — привязать профиль Brawl Stars {pe('game')}\n"
         "• <code>top active</code> · <code>top lp</code> · <code>top rep</code> · <code>top trophies</code> (можно <code>day</code>/<code>week</code>)\n"
         f"• <code>streak</code> — твоя серия дней подряд {pe('fire')}\n"
         f"• <code>season</code> — топ сезона (месяца) · <code>hof</code> — зал славы {pe('cup')}\n"
@@ -3835,17 +3848,86 @@ def _help_admin_text():
     )
 
 
+def help_menu_keyboard(owner_id):
+    """Кнопочное меню справки. owner_id — кто открыл (жать может только он)."""
+    u = owner_id
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👤 Профиль и статистика", callback_data=f"help:profile:{u}")],
+        [InlineKeyboardButton("🛒 Клан", callback_data=f"help:clan:{u}"),
+         InlineKeyboardButton("🎮 Игры", callback_data=f"help:games:{u}")],
+        [InlineKeyboardButton("🤖 AI", callback_data=f"help:ai:{u}"),
+         InlineKeyboardButton("⚖️ Обжалование", callback_data=f"help:appeal:{u}")],
+        [InlineKeyboardButton("🛡 Админ-команды", callback_data=f"help:admin:{u}")],
+    ])
+
+
+def _help_intro():
+    return (f"{pe('person')} <b>СПРАВКА — БОТ КЛАНА {CLAN_NAME}</b>\n{CLAN_LINE}\n"
+            f"<i>Все команды пишутся с точкой в начале: <code>.help</code>, <code>.profile</code> …</i>\n"
+            f"<i>Выбери раздел кнопкой — команды откроются прямо здесь.</i>\n"
+            f"{pe('lp')} LP капают за каждое сообщение · статистика по МСК")
+
+
+def _help_section(key):
+    """Текст одного раздела справки (в сворачиваемой цитате). Команды — с точкой-префиксом."""
+    if key == "profile":
+        return (f"{pe('person')} <b>Профиль и статистика</b>\n<blockquote expandable>"
+                "• <code>.profile</code> — твой профиль (или <code>.profile @юзер</code> / ответом — чужой)\n"
+                "• <code>.lp</code> — твой баланс LP\n"
+                "• <code>.+</code> (ответом) — дать репутацию · <code>.-</code> — снять\n"
+                "• <code>.tag #ТВОЙТЕГ</code> — привязать профиль Brawl Stars\n"
+                "• <code>.top active</code> · <code>.top lp</code> · <code>.top rep</code> · <code>.top trophies</code> (+ <code>day</code>/<code>week</code>)\n"
+                "• <code>.streak</code> — серия дней подряд\n"
+                "• <code>.season</code> — топ сезона · <code>.hof</code> — зал славы</blockquote>")
+    if key == "clan":
+        return (f"{pe('shop')} <b>Клан</b>\n<blockquote expandable>"
+                "• <code>.shop</code> — магазин и как получать LP\n"
+                "• <code>.norms</code> — обязательные нормы клана\n"
+                "• <code>.rules</code> — кодекс клана\n"
+                "• <code>.docs</code> — о боте и история обновлений\n"
+                "• <code>.faq</code> — соглашение и FAQ (в личке боту)</blockquote>")
+    if key == "games":
+        return (f"{pe('game')} <b>Игры</b>\n<blockquote expandable>"
+                "<code>.dice</code> · <code>.darts</code> · <code>.basket</code> · <code>.football</code> · <code>.bowling</code> · "
+                "<code>.casino</code> · <code>.coin</code> · <code>.8ball &lt;вопрос&gt;</code> · <code>.rps камень</code> · "
+                "<code>.pick a, b, c</code> · <code>.number 7</code> · <code>.duel</code> · <code>.roll</code></blockquote>")
+    if key == "ai":
+        return (f"{pe('robot')} <b>AI-помощник</b>\n<blockquote expandable>"
+                "• <code>.Linkor &lt;вопрос&gt;</code> — спросить AI про Brawl Stars или что угодно\n"
+                "• <code>.joke</code> — шутка · <code>.fact</code> — факт · <code>.toast</code> — тост\n"
+                "<i>Без точки слово «linkor» в обычной речи AI не вызывает.</i></blockquote>")
+    if key == "appeal":
+        return (f"{pe('scales')} <b>Обжалование наказания</b>\n<blockquote expandable>"
+                "Получил наказание и считаешь его несправедливым? Напиши боту "
+                "<b>в личку</b> команду <code>.appeal</code> — заявка с твоим объяснением уйдёт администрации, "
+                "и они решат вопрос.</blockquote>")
+    if key == "admin":
+        return (f"{pe('shield')} <b>Админ-команды</b> <i>(работают только у администрации)</i>\n<blockquote expandable>"
+                "<b>Модерация</b> (ответом/<code>@юзер</code>): <code>.warn</code> · <code>.unwarn</code> · "
+                "<code>.clearwarns</code> · <code>.mute 12ч причина</code> · <code>.unmute</code> · <code>.kick</code> · "
+                "<code>.ban</code> · <code>.unban</code>\n"
+                "<i>длительность: <code>30м</code> · <code>12ч</code> · <code>7д</code></i>\n\n"
+                "<b>Управление:</b> <code>.role модер</code> · <code>.lp 200</code>/<code>.lp -50</code>/<code>.lp =500</code> · "
+                "<code>.who</code> · <code>.summary</code> · <code>.announce текст</code> · <code>.summon текст</code> · "
+                "<code>.конкурс</code> (в личке)\n\n"
+                "<b>Владелец</b> (в чате и в личке): <code>.modlog</code> · <code>.analytics</code> · <code>.backup</code> · "
+                "<code>.bonusall 150</code> · <code>.checknorms</code> · <code>.snapshotnorms</code>\n\n"
+                "<b>Опрос:</b> <code>.poll Вопрос? | вар1 | вар2</code>\n"
+                "<b>Нормы</b> (с 22 июня): авто по Пн/Вс · <code>.отпуск @юзер 1–30</code>\n"
+                "<b>Награды</b> (ответом): <code>.норма ранг</code> · <code>.норма кубки</code></blockquote>")
+    return _help_intro()
+
+
 async def help_cmd(update, context, include_admin=False):
-    if (not include_admin and update.effective_chat and update.effective_chat.type == "private"
-            and update.effective_user):
+    kb = help_menu_keyboard(update.effective_user.id)
+    try:
+        await update.message.reply_text(_help_intro(), parse_mode=ParseMode.HTML, reply_markup=kb)
+    except Exception as e:
+        print(f"[HELP] ошибка отправки справки: {e}", flush=True)
         try:
-            include_admin = await is_staff(context, update.effective_user.id)
+            await update.message.reply_text(f"Справка {CLAN_NAME}. Выбери раздел кнопкой.", reply_markup=kb)
         except Exception:
-            include_admin = False
-    text = _help_member_text()
-    if include_admin:
-        text += "\n\n" + _help_admin_text()
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+            pass
 
 
 async def rules_cmd(update, context):
@@ -4035,7 +4117,7 @@ def main():
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
     app.add_handler(ChatMemberHandler(record_member, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(CallbackQueryHandler(giveaway_join, pattern="^gw_join$"))
-    app.add_handler(CallbackQueryHandler(on_action_callback, pattern="^(menu|buy|order|appeal|faq):"))
+    app.add_handler(CallbackQueryHandler(on_action_callback, pattern="^(menu|buy|order|appeal|faq|help):"))
     app.add_handler(CallbackQueryHandler(on_unknown_callback))   # подстраховка: любой не пойманный колбэк
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, private_router))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, text_router))
