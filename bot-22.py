@@ -225,17 +225,21 @@ CITADEL_BONUS_LP = 150
 # Схема названий патчей: "LINKOR BOSS <версия> «<кодовое имя>»".
 # Кодовые имена — морская тематика (Линкор = боевой корабль). Названия придумывает Claude.
 BOT_FULL_NAME = "LINKOR BOSS"
-BOT_VERSION = "5.1"
-PATCH_CODE = "LB-5.1"
-PATCH_NAME = "Цитадель"        # патч 5.1 в рамках глобального обновления «Цитадель»
+BOT_VERSION = "5.2"
+PATCH_CODE = "LB-5.2"
+PATCH_NAME = "Гарнизон"        # патч 5.2 в рамках глобального обновления «Цитадель»
 PATCH_TYPE = "обновление"
 BOT_OWNER = "@yaukoshi_san"    # владелец и разработчик бота (ты)
 BOT_ADMIN = "@VoxTecn"         # админ бота / владелец чата
-RELEASE_DATE = "05.06.2026"
+RELEASE_DATE = "06.06.2026"
 
 # История изменений ДЛЯ УЧАСТНИКОВ по версиям (новые сверху). Без админских/секретных команд.
 # Формат: (версия, тип, [пункты])
 CHANGELOG_HISTORY = [
+    ("5.2", "обновление", [
+        "🛒 Магазин стал кнопочным: короткое сообщение и разделы (как получать LP, за рубли, правила) открываются прямо в нём же — а товары всегда под рукой одной кнопкой.",
+        "🧹 Топы теперь чистятся сами: как только участник выходит из клана, он автоматически убирается из всех топов, LP и статистики — в рейтингах только нынешние бойцы. Вышедших ранее можно убрать разом (у администрации есть команда).",
+    ]),
     ("5.1", "обновление", [
         "📲 Меню стало аккуратным: кнопки работают только у того, кто открыл меню, а разделы открываются прямо в том же сообщении — чат больше не засоряется.",
         "⭐ Репутацию теперь можно не только повышать, но и понижать: ответь на сообщение знаком «-» (или «-rep»). Репутация может уходить в минус.",
@@ -1644,7 +1648,7 @@ async def show_top(update, context, args):
         marker = medals.get(i) or f"{pe('star')}"
         lines.append(f"<b>{i+1}.</b> {marker} {esc(r['name'])} — <b>{val}</b>{unit}")
     if cat == "trophies":
-        lines.append(f"\n<i>Кубки обновляются, когда игрок пишет</i> <code>tag</code>.")
+        lines.append(f"\n<i>Кубки обновляются, когда игрок привязывает тег командой</i> <code>.tag #ТЕГ</code>")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
@@ -1762,6 +1766,49 @@ def store_keyboard():
     return InlineKeyboardMarkup(rows)
 
 
+def store_menu_keyboard(owner_id):
+    """Кнопочное меню магазина: разделы-инфо (сворачиваемые) + кнопки покупки товаров."""
+    u = owner_id
+    rows = [
+        [InlineKeyboardButton("💰 Как получать LP", callback_data=f"store:earn:{u}"),
+         InlineKeyboardButton("💎 За рубли", callback_data=f"store:rubles:{u}")],
+        [InlineKeyboardButton("📜 Правила STORE", callback_data=f"store:rules:{u}")],
+    ]
+    for key, name, price, _e in STORE_ITEMS:
+        rows.append([InlineKeyboardButton(f"{name} — {price} LP", callback_data=f"buy:{key}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _store_intro():
+    return (f"{pe('shop')} <b>{CLAN_NAME} STORE</b>\n{CLAN_LINE}\n"
+            f"<i>Внутренний магазин клана. LP зарабатываются только активностью.</i>\n"
+            f"{pe('lp')} Баланс до {LP_MAX} LP · нажми товар — оформим заявку, LP зарезервируются.\n"
+            f"<i>Разделы ниже — нажми, чтобы узнать подробнее.</i>")
+
+
+def _store_section(key):
+    """Раздел магазина (в сворачиваемой цитате)."""
+    if key == "earn":
+        return (f"{pe('growth')} <b>Как получать LP</b>\n<blockquote expandable>"
+                f"{pe('msg')} За каждое сообщение в чате — будь активен каждый день, LP копятся "
+                f"(есть честный дневной потолок от спама)\n"
+                f"{pe('cup')} Норма кубков — +{NORM_TROPHY_LP} LP · {pe('star')} Норма ранга (Легендарный) — +{NORM_RANK_LP} LP\n"
+                f"{pe('hug')} Помощь, медийность, сложные задачи — на усмотрение администрации\n"
+                f"<i>LP нельзя купить, передать или вывести — только заработать.</i></blockquote>")
+    if key == "rubles":
+        return (f"{pe('crown')} <b>За рубли</b>\n<blockquote expandable>"
+                f"Паки и гемы — цены по курсу, уточняй у менеджера {STORE_MANAGER}. "
+                f"Покупка и выдача товара — через менеджера.\n"
+                f"{pe('rate')} Курс: 1 LP = 0.5 ₽ скидки при покупке за рубли.</blockquote>")
+    if key == "rules":
+        return (f"{pe('scales')} <b>Правила STORE</b>\n<blockquote expandable>"
+                f"Накрутка и передача LP запрещены, фейковые оплаты — блокировка. "
+                f"При ошибке начисления по вине STORE — компенсируем.\n"
+                f"Улучшение до BP Plus покупается, только если у тебя уже есть Brawl Pass.\n"
+                f"{pe('clock')} Работаем ежедневно {STORE_OPEN_HOUR}:00–{STORE_CLOSE_HOUR}:00 МСК.</blockquote>")
+    return _store_intro()
+
+
 def _proxy_update(update):
     """Обёртка для колбэков: даёт .message (сообщение под кнопкой), .effective_chat/.effective_user."""
     cq = update.callback_query
@@ -1791,33 +1838,15 @@ async def store_info(update, context):
             f"{pe('lock')} <b>{CLAN_NAME} STORE — закрыт</b>\n{CLAN_LINE}\n"
             f"Магазин работает ежедневно с <b>{STORE_OPEN_HOUR}:00</b> до <b>{STORE_CLOSE_HOUR}:00</b> по МСК.\n"
             f"Загляни в рабочее время {pe('catneutral')}", parse_mode=ParseMode.HTML)
-    await update.message.reply_text(
-        f"{pe('shop')} <b>{CLAN_NAME} STORE</b>\n{CLAN_LINE}\n"
-        f"<i>Внутренний магазин клана. Чем активнее ты — тем больше преимуществ.</i>\n\n"
-        f"{pe('lp')} <b>Что такое LP</b>\n"
-        f"<blockquote>LP (Linkor Points) — внутренняя валюта клана. Их нельзя купить, "
-        f"передать или вывести — только заработать активностью. Баланс до {LP_MAX} LP.</blockquote>\n"
-        f"{pe('growth')} <b>Как получать LP</b>\n"
-        f"<blockquote>{pe('msg')} За каждое сообщение в чате — будь активным каждый день, и LP копятся\n"
-        f"{pe('fire')} Чем выше твоя дневная активность, тем больше LP (есть честный дневной потолок от спама)\n"
-        f"{pe('cup')} Норма кубков — +{NORM_TROPHY_LP} LP · {pe('star')} Норма ранга (Легендарный) — +{NORM_RANK_LP} LP\n"
-        f"{pe('hug')} Помощь, медийность, сложные задачи — на усмотрение администрации</blockquote>\n"
-        f"{pe('pin')} <b>Товары за LP</b>\n"
-        f"<blockquote>{pe('bp')} Brawl Pass — 850 LP\n"
-        f"{pe('bpup')} Улучшение Brawl Pass до BP Plus — 750 LP\n"
-        f"{pe('bpplus')} Brawl Pass Plus — 1650 LP\n"
-        f"{pe('pro')} Pro Pass — 2800 LP\n"
-        f"{pe('rate')} Курс: 1 LP = 0.5 ₽ скидки при покупке за рубли</blockquote>\n"
-        f"<i>Улучшение покупается только если у тебя уже есть Brawl Pass.</i>\n"
-        f"{pe('crown')} <b>За рубли</b>\n"
-        f"<blockquote>Паки и гемы — цены по курсу, уточняй у менеджера {STORE_MANAGER}.\n"
-        f"Покупка и получение товара — тоже через менеджера.</blockquote>\n"
-        f"{pe('scales')} <b>Правила STORE</b>\n"
-        f"<blockquote>Накрутка и передача LP запрещены, фейковые оплаты — блокировка. "
-        f"При ошибке начисления по вине STORE — компенсируем.</blockquote>\n"
-        f"{pe('clock')} Работаем ежедневно {STORE_OPEN_HOUR}:00–{STORE_CLOSE_HOUR}:00 МСК.\n"
-        f"{pe('lp')} <i>Нажми на товар ниже — оформим заявку, LP зарезервируются до выдачи.</i>",
-        parse_mode=ParseMode.HTML, reply_markup=store_keyboard())
+    kb = store_menu_keyboard(update.effective_user.id)
+    try:
+        await update.message.reply_text(_store_intro(), parse_mode=ParseMode.HTML, reply_markup=kb)
+    except Exception as e:
+        print(f"[STORE] ошибка отправки магазина: {e}", flush=True)
+        try:
+            await update.message.reply_text(f"{CLAN_NAME} STORE. Выбери раздел или товар кнопкой.", reply_markup=kb)
+        except Exception:
+            pass
 
 
 async def norms_info(update, context):
@@ -1959,6 +1988,68 @@ def has_agreed(user_id):
     row = conn.execute("SELECT agreed_faq FROM users WHERE chat_id=? AND user_id=?",
                        (ALLOWED_CHAT_ID, user_id)).fetchone()
     return bool(row and row["agreed_faq"])
+
+
+# Статусы, означающие, что человек ещё в чате (всё остальное = вышел/исключён/забанен).
+ACTIVE_MEMBER_STATUSES = (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR,
+                          ChatMemberStatus.OWNER, ChatMemberStatus.RESTRICTED)
+
+# Авто-чистка: True — как только участник вышел/исключён из чата, бот сразу удаляет его из системы
+# (топы, LP, статистика). Полностью без команд. False — чистить только вручную командой .чистка.
+AUTO_PURGE_ON_LEAVE = True
+
+
+def purge_user(chat_id, user_id):
+    """Полностью удаляет участника из системы: пропадает из всех топов, LP, статистики и сбора."""
+    for tbl in ("users", "warns", "stats", "lp_log", "pending_lp", "norm_warns"):
+        try:
+            conn.execute(f"DELETE FROM {tbl} WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+        except Exception:
+            pass
+    conn.commit()
+
+
+async def cleanup_left_members(update, context):
+    """Проходит по всем участникам из базы и удаляет тех, кто уже вышел/исключён из чата.
+    Это и есть авто-чистка топов: одна команда — и все «бывшие» исчезают из системы."""
+    chat_id = update.effective_chat.id
+    rows = conn.execute("SELECT user_id, name FROM users WHERE chat_id=?", (chat_id,)).fetchall()
+    total = len(rows)
+    if not total:
+        return await update.message.reply_text("В базе пока нет участников для проверки.")
+    status_msg = await update.message.reply_text(
+        f"{pe('clock')} Проверяю {total} участников — кто ещё в чате… Немного подожди.",
+        parse_mode=ParseMode.HTML)
+    protected = {LEADER_ID} | EXCLUDED_IDS | CONTEST_CREATORS | STORE_ADMINS
+    removed, checked = [], 0
+    for r in rows:
+        uid = r["user_id"]
+        checked += 1
+        if uid in protected:
+            continue
+        try:
+            m = await context.bot.get_chat_member(chat_id, uid)
+            if m.status not in ACTIVE_MEMBER_STATUSES:
+                purge_user(chat_id, uid)
+                removed.append(r["name"] or str(uid))
+        except Exception:
+            pass   # не удалось узнать статус — на всякий случай оставляем
+        if checked % 20 == 0:
+            await asyncio.sleep(1)   # бережём лимиты Telegram
+    if removed:
+        names = ", ".join(esc(n) for n in removed[:30])
+        extra = f" и ещё {len(removed) - 30}" if len(removed) > 30 else ""
+        txt = (f"{pe('check')} <b>Чистка завершена!</b>\n"
+               f"Удалено вышедших из клана: <b>{len(removed)}</b> из {total} проверенных.\n"
+               f"<blockquote expandable>{names}{extra}</blockquote>\n"
+               f"<i>Они пропали из всех топов, LP и статистики.</i>")
+    else:
+        txt = (f"{pe('check')} Чистка завершена: все {total} участников ещё в чате — удалять некого. "
+               f"Чисто! {pe('star')}")
+    try:
+        await status_msg.edit_text(txt, parse_mode=ParseMode.HTML)
+    except Exception:
+        await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
 
 
 async def summon_all(update, context, text):
@@ -2177,7 +2268,7 @@ async def on_action_callback(update, context):
                 cap["text"] = (f"{pe('fire')} Твоя серия: <b>{cur} {_days_word(cur)} подряд</b>\n"
                                f"{pe('star')} Рекорд: <b>{best} {_days_word(best)}</b>")
             elif action == "help":
-                cap["text"] = _help_member_text()
+                cap["text"] = _help_intro()
         except Exception as e:
             print(f"[MENU] ошибка раздела {action}: {e}", flush=True)
         if cap["markup"] is not None:
@@ -2216,6 +2307,28 @@ async def on_action_callback(update, context):
             await cq.edit_message_text(_help_section(action), parse_mode=ParseMode.HTML, reply_markup=back)
         except Exception as e:
             print(f"[HELP] не удалось показать раздел {action}: {e}", flush=True)
+        return
+
+    # ----- КНОПОЧНЫЙ МАГАЗИН (store:) -----
+    if data.startswith("store:"):
+        parts = data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        owner_id = int(parts[2]) if len(parts) > 2 and parts[2].lstrip("-").isdigit() else user.id
+        if user.id != owner_id:
+            return await cq.answer("Этот магазин открыл другой игрок. Открой свой — напиши: .shop", show_alert=True)
+        await cq.answer()
+        if action in ("menu", "back"):
+            try:
+                await cq.edit_message_text(_store_intro(), parse_mode=ParseMode.HTML,
+                                           reply_markup=store_menu_keyboard(owner_id))
+            except Exception:
+                pass
+            return
+        back = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"store:menu:{owner_id}")]])
+        try:
+            await cq.edit_message_text(_store_section(action), parse_mode=ParseMode.HTML, reply_markup=back)
+        except Exception as e:
+            print(f"[STORE] не удалось показать раздел {action}: {e}", flush=True)
         return
 
     # ----- ПОКУПКА (резерв LP + заявка менеджеру) -----
@@ -2793,6 +2906,44 @@ async def handle_triggers(update, context, text, low, parts):
     if first in ("summon", "call"):
         if await require(update, context, ADMIN):
             await summon_all(update, context, text)
+        return True
+    if first in ("удалить", "remove", "delete", "del", "kickdb"):
+        if not await require(update, context, ADMIN):
+            return True
+        tgt = resolve_target(update, parts)
+        if not tgt:
+            await update.message.reply_text(
+                f"{pe('person')} Кого удалить из системы? Ответь на его сообщение или укажи: "
+                f"<code>.удалить @ник</code> или <code>.удалить ID</code>.", parse_mode=ParseMode.HTML)
+            return True
+        if tgt.id in ({LEADER_ID} | EXCLUDED_IDS):
+            await update.message.reply_text("Этого пользователя удалять нельзя (владелец/штатный админ).")
+            return True
+        purge_user(update.effective_chat.id, tgt.id)
+        await update.message.reply_text(
+            f"{pe('check')} {esc(getattr(tgt, 'full_name', 'Боец'))} удалён из системы — "
+            f"пропал из всех топов, LP и статистики.", parse_mode=ParseMode.HTML)
+        return True
+    if first in ("отвязать", "untag", "отвязка"):
+        if not await require(update, context, MODER):
+            return True
+        tgt = resolve_target(update, parts)
+        if not tgt:
+            await update.message.reply_text(
+                f"{pe('game')} У кого снять игровой тег? Ответь на сообщение или укажи: "
+                f"<code>.отвязать @ник</code> или <code>.отвязать ID</code>.", parse_mode=ParseMode.HTML)
+            return True
+        conn.execute("UPDATE users SET brawl_tag=NULL, brawl_trophies=0 WHERE chat_id=? AND user_id=?",
+                     (update.effective_chat.id, tgt.id))
+        conn.commit()
+        await update.message.reply_text(
+            f"{pe('check')} Тег у {esc(getattr(tgt, 'full_name', 'бойца'))} отвязан — "
+            f"он пропал из топа по кубкам. Может привязать свой: <code>.tag #ТЕГ</code>.",
+            parse_mode=ParseMode.HTML)
+        return True
+    if first in ("чистка", "cleanup", "prune"):
+        if await require(update, context, ADMIN):
+            await cleanup_left_members(update, context)
         return True
     if first in ("finish", "endgw") and active_giveaways.get(update.effective_chat.id):
         await end_giveaway(update, context); return True
@@ -3765,8 +3916,8 @@ async def text_router(update, context):
 
 
 async def record_member(update, context):
-    """Записывает участников по служебным событиям (вход/выход/смена статуса),
-    чтобы со временем «summon» охватывал больше людей."""
+    """Реестр участников по служебным событиям. Активные — фиксируются (для сбора/статистики),
+    вышедшие/исключённые — автоматически удаляются из системы (топы, LP, статистика)."""
     try:
         cm = update.chat_member or update.my_chat_member
         if not cm or not cm.chat or cm.chat.id != ALLOWED_CHAT_ID:
@@ -3775,10 +3926,13 @@ async def record_member(update, context):
         if not member or member.is_bot:
             return
         status = cm.new_chat_member.status
-        # активные статусы — фиксируем участника; вышедших/забаненных не добавляем
-        if status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR,
-                      ChatMemberStatus.OWNER, ChatMemberStatus.RESTRICTED):
+        if status in ACTIVE_MEMBER_STATUSES:
             ensure_user(ALLOWED_CHAT_ID, member)
+        elif AUTO_PURGE_ON_LEAVE and member.id not in (
+                {LEADER_ID} | EXCLUDED_IDS | CONTEST_CREATORS | STORE_ADMINS):
+            # вышел / исключён / забанен — сразу убираем из системы (и из топа по кубкам тоже)
+            purge_user(ALLOWED_CHAT_ID, member.id)
+            print(f"[AUTO-CLEAN] участник {member.id} вышел из чата — удалён из системы.", flush=True)
     except Exception:
         pass
 
@@ -3962,6 +4116,9 @@ def _help_section(key):
                 "<b>Управление:</b> <code>.role модер</code> · <code>.lp 200</code>/<code>.lp -50</code>/<code>.lp =500</code> · "
                 "<code>.who</code> · <code>.summary</code> · <code>.announce текст</code> · <code>.summon текст</code> · "
                 "<code>.конкурс</code> (в личке)\n\n"
+                "<b>Чистка топов:</b> <code>.чистка</code> — авто-удалить всех, кто вышел из чата · "
+                "<code>.удалить</code> (ответом/@/ID) — убрать одного из системы · "
+                "<code>.отвязать</code> (ответом/@/ID) — снять чужой игровой тег\n\n"
                 "<b>Владелец</b> (в чате и в личке): <code>.modlog</code> · <code>.analytics</code> · <code>.backup</code> · "
                 "<code>.bonusall 150</code> · <code>.checknorms</code> · <code>.snapshotnorms</code>\n\n"
                 "<b>Опрос:</b> <code>.poll Вопрос? | вар1 | вар2</code>\n"
@@ -4162,8 +4319,7 @@ async def on_startup(app):
                   f"{pe('clock')} Старт: <b>{when}</b> (МСК) · сборка <code>{boot_id}</code>\n"
                   f"<blockquote expandable>Это сообщение приходит при КАЖДОМ запуске. Пришло — значит "
                   f"на сервере уже свежий код.\n"
-                  f"Новинки этой версии: команды только с точкой (<code>.help</code>), "
-                  f"админ-команды видны и доступны только администрации.</blockquote>"),
+                  f"Что нового в этой версии — команда <code>.docs</code>.</blockquote>"),
             parse_mode=ParseMode.HTML)
     except Exception as e:
         print(f"[STARTUP] не смог уведомить владельца ({LEADER_ID}): {e} — "
@@ -4186,7 +4342,7 @@ def main():
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
     app.add_handler(ChatMemberHandler(record_member, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(CallbackQueryHandler(giveaway_join, pattern="^gw_join$"))
-    app.add_handler(CallbackQueryHandler(on_action_callback, pattern="^(menu|buy|order|appeal|faq|help):"))
+    app.add_handler(CallbackQueryHandler(on_action_callback, pattern="^(menu|buy|order|appeal|faq|help|store):"))
     app.add_handler(CallbackQueryHandler(on_unknown_callback))   # подстраховка: любой не пойманный колбэк
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, private_router))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, text_router))
