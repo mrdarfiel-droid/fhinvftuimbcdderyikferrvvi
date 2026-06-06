@@ -1,0 +1,4132 @@
+# -*- coding: utf-8 -*-
+"""
+============================================================
+        БОТ КЛАНА LINKOR  (в стиле Iris) — версия 3
+============================================================
+Новое в этой версии:
+  • Бот работает ТОЛЬКО в одном указанном чате (см. ALLOWED_CHAT_ID),
+    из остальных групп выходит сам.
+  • Система LP (Linkor Points) — валюта клана, отображается в профиле.
+  • Точная статистика по МОСКОВСКОМУ времени:
+    сообщений всего / сегодня / за неделю (Пн 00:00 — Вс 23:59 МСК).
+  • Стартовые балансы LP загружаются из списка SEED_LP по @username.
+
+Запуск:
+  1) pip install python-telegram-bot --upgrade
+  2) Вставь токен в TOKEN.
+  3) python bot.py
+  4) Добавь бота в чат, сделай админом (банить + ограничивать).
+  5) Напиши в чате /id — бот покажет ID чата.
+  6) Впиши этот ID в ALLOWED_CHAT_ID и перезапусти бота.
+============================================================
+"""
+
+import html
+import os
+import re
+import json
+import random
+import sqlite3
+import time
+import asyncio
+import httpx
+from types import SimpleNamespace
+from datetime import datetime, timedelta, timezone
+
+from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ChatMemberStatus, ParseMode
+from telegram.ext import (
+    Application,
+    ApplicationHandlerStop,
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    ChatMemberHandler,
+    filters,
+)
+
+# ============================================================
+#                      НАСТРОЙКИ
+# ============================================================
+
+def _find_bot_token():
+    """Находит токен бота среди переменных окружения под любым именем."""
+    pattern = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{20,}$")
+    for name in ("TOKEN", "BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "BOT_API_TOKEN",
+                 "BOT_IP_TOKEN", "API_TOKEN", "TG_TOKEN"):
+        v = (os.environ.get(name) or "").strip()
+        if pattern.match(v):
+            return v
+    for v in os.environ.values():                 # запас: любая переменная, похожая на токен
+        v = (v or "").strip()
+        if pattern.match(v):
+            return v
+    return "СЮДА_ВСТАВЬ_ТОКЕН"
+
+
+TOKEN = _find_bot_token()
+
+# ID чата, в котором работает бот. 0 = пока не задан (бот работает везде,
+# чтобы ты мог узнать ID командой /id). После — впиши сюда число и перезапусти.
+ALLOWED_CHAT_ID = -1003256279775
+
+# Папка для данных (база переживает редеплой только в постоянном хранилище bothost).
+# Приоритет: DATA_DIR → SHARED_DIR → /app/shared (общее хранилище bothost) → /app/data → текущая папка.
+DATA_DIR = os.getenv("DATA_DIR") or os.getenv("SHARED_DIR") or ""
+if not DATA_DIR:
+    for _p in ("/app/shared", "/app/data"):
+        if os.path.isdir(_p):
+            DATA_DIR = _p
+            break
+    else:
+        DATA_DIR = "."
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except Exception:
+    DATA_DIR = "."
+DB_FILE = os.path.join(DATA_DIR, "linkor.db")
+print(f"[DB] база данных: {DB_FILE}", flush=True)
+
+WARN_LIFETIME_DAYS = 7
+MAX_WARNS = 3
+
+LP_MAX = 10000                     # потолок LP (правила STORE)
+LP_MIN = -10000                    # минимальный баланс (штрафы могут уводить в минус)
+LP_WEEKLY_CAP = 250                # недельный лимит для НАГРАД за нормы (кубки/ранг). Сообщения — отдельно, по дневному лимиту.
+LP_PER_MESSAGE = 0.05              # LP за каждое сообщение (чем активнее за день — тем больше)
+MSG_DAILY_CAP = 1500               # макс. сообщений в день, за которые капают LP (антиспам-потолок; выше — LP не идут)
+SELF_SPAM_LIMIT = 10               # сколько сообщений подряд (без ответа других) ещё дают LP; дальше — 0 (анти-фарм «сам с собой»)
+WEEKLY_MSG_NORM = 450              # клановая норма сообщений/нед (для регламента)
+SUPER_NORM_MSGS = 1250             # порог «сверх-активности» (только для отметки в нормах)
+WARN_LP_PENALTY = 100              # сколько LP сжигать на стадии варна
+STARTING_LP = 50                   # стартовый баланс нового участника
+
+# Ежедневный стрик: награда не каждый день (чтобы не было инфляции), а за «вехи» серии.
+# {день_серии: бонус_LP}. Экономику держим скромной — основной заработок всё равно от активности.
+STREAK_MILESTONES = {3: 5, 7: 15, 14: 30, 30: 75, 60: 120, 100: 250}
+
+# Сезоны: топ активности за календарный месяц (МСК). В конце месяца топ-3 получают LP и попадают
+# в зал славы, счёт сезона обнуляется (новый месяц считается заново). {место: бонус_LP}.
+SEASON_REWARDS = {1: 200, 2: 120, 3: 60}
+
+# Анти-рейд: если за RAID_WINDOW секунд войдёт RAID_JOIN_COUNT+ человек — включается защита
+# на RAID_LOCKDOWN_MIN минут (новые входящие в это время получают мут до проверки админом).
+RAID_JOIN_COUNT = 5
+RAID_WINDOW = 60
+RAID_LOCKDOWN_MIN = 10
+
+# Префикс команд: в ЧАТЕ бот реагирует ТОЛЬКО на сообщения, начинающиеся с этого символа
+# (.help, .profile, .Linkor ...). Обычные сообщения без точки командой не считаются — так бот
+# не сработает случайно (например, от слова «linkor» в обычной речи). В личке точка необязательна.
+CMD_PREFIX = "."
+
+# Команды участников, недоступные без принятого соглашения (faq/terms/help оставляем свободными).
+GATED_COMMANDS = {
+    "profile", "prof", "proff", "top", "shop", "store", "norms", "rules", "docs",
+    "tag", "brawl", "untag", "streak", "season", "hof", "halloffame", "hall", "menu",
+    "lp", "joke", "fact", "toast", "ai", "linkor",
+    "dice", "darts", "basket", "football", "bowling", "casino", "coin", "8ball",
+    "rps", "pick", "number", "duel", "roll", "guess",
+}
+
+# Управляющие команды владельца — работают только в личке с ботом (в группе не выполняются).
+ADMIN_DM_COMMANDS = {
+    "bonusall", "lpall", "грантвсем", "всемлп", "backup", "бэкап", "бекап",
+    "modlog", "log", "журнал", "analytics", "dashboard", "аналитика", "статклан",
+    "checknorms", "проверканорм", "snapshotnorms", "снимокнорм",
+}
+
+LEADER_ID = 1644726751             # лидер клана (максимальный баланс)
+EXCLUDED_IDS = {485558746, 44125359}        # админы вне экономики: без LP и конкурсов
+CONTEST_CREATORS = {1644726751, 485558746}  # кто создаёт конкурсы (в личке)
+
+# --- Оформление клана ---
+CLAN_NAME = "LINKOR"
+CLAN_LINE = "━━━━━━━━━━━━━━━"   # разделитель для официальных сообщений
+
+# Премиум-эмодзи (custom emoji). Формат: имя -> (id, запасной обычный смайлик).
+# id пустой "" -> покажется только запасной смайлик. Рендерятся, т.к. владелец бота с Premium.
+PREMIUM_EMOJI_ENABLED = True   # премиум-эмодзи включены (анимированные). Все сообщения с ними идут с parse_mode=HTML
+PREMIUM_EMOJI = {
+    "lp":          ("5411441682363202957", "🪙"),   # значок LP
+    "shop":        ("5213211117538521843", "🛒"),   # магазин
+    "mega":        ("5213363464323479192", "📢"),   # мегафон (объявления/сбор)
+    "excl":        ("5220226053263342894", "❗"),   # восклицательный знак (нормы)
+    "bp":          ("5213473832098084979", "🎫"),   # Brawl Pass
+    "bpplus":      ("5427033788037217281", "🎟"),   # Brawl Pass Plus
+    "bpup":        ("5212955451020293672", "🔼"),   # улучшение до BP+
+    "pro":         ("5328039924350348810", "💎"),   # Pro Pass
+    "cup":         ("5213326931331659859", "🏆"),   # кубок
+    "catlove":     ("5274108397971592115", "😻"),   # кошкодевочка с сердечками (приветствие)
+    "catneutral":  ("5273934086723884809", "😺"),   # кошкодевочка нейтральная
+    "fire":        ("4956499161319998529", "🔥"),   # огонь (активность/хайп)
+    "crown":       ("4958725487682650920", "👑"),   # корона (лидер/иерархия)
+    "shield":      ("4958900559139570572", "🛡"),   # щит (модерация)
+    "star":        ("5438496463044752972", "⭐"),   # звезда (репутация)
+    "robot":       ("5332814197111663865", "🤖"),   # робот/ИИ
+    "game":        ("5467774597971588287", "🎮"),   # геймпад (игры)
+    "calendar":    ("5413879192267805083", "📅"),   # календарь (дата)
+    "lock":        ("5210939187213121918", "🔒"),   # замок (закрытый магазин)
+    "scales":      ("5400250414929041085", "⚖️"),   # весы (правила)
+    # --- пачка 4.6 ---
+    "msg":         ("4956475826762679249", "💬"),   # сообщение/активность
+    "stats":       ("5231200819986047254", "📊"),   # статистика
+    "gold":        ("5440539497383087970", "🥇"),   # медаль 1 место
+    "silver":      ("5447203607294265305", "🥈"),   # медаль 2 место
+    "bronze":      ("5453902265922376865", "🥉"),   # медаль 3 место
+    "check":       ("4956721670690702265", "✅"),   # галочка
+    "cross":       ("4958526153955476488", "❌"),   # крестик
+    "warn":        ("5447644880824181073", "⚠️"),   # предупреждение (варн)
+    "mute":        ("6030467682283818947", "🔇"),   # мут
+    "unmute":      ("5222171647678630073", "🔊"),   # размут
+    "ban":         ("5210939187213121918", "🚫"),   # бан (тот же значок-замок)
+    "unban":       ("5220151819048597492", "🔓"),   # разбан
+    "hug":         ("5375069356680033632", "🤝"),   # обнимашки/рукопожатие
+    "contest":     ("4956596167451346576", "🎉"),   # конкурс
+    "pin":         ("5397782960512444700", "📌"),   # булавка (закрепить/итоги)
+    "rate":        ("5402186569006210455", "💱"),   # курс
+    "growth":      ("5429651785352501917", "📈"),   # рост
+    "clock":       ("5902331842723319210", "🕙"),   # часы
+    "role":        ("4958621433509970793", "🏷"),   # роль
+    "envelope":    ("5253742260054409879", "📨"),   # конверт/обжалование
+    "folder":      ("5433653135799228968", "📑"),   # папка (документация)
+    "note":        ("6032746961298264832", "📝"),   # блокнот с карандашом (сводка)
+    "scroll":      ("5217939515754174728", "📜"),   # свиток (правила/кодекс)
+    "person":      ("5296665364346727584", "👤"),   # человек (профиль)
+    "bulb":        ("5422439311196834318", "💡"),   # лампочка (идея)
+}
+
+# --- Топики (форумные темы). 0 = не задано. ID темы узнай командой "айди" в нужном топике ---
+NO_MODERATION_TOPIC_ID = 6770  # топик "cherdak linkor" — там автомодерация НЕ работает
+ANNOUNCE_TOPIC_ID = 0          # топик для объявлений (куда бот пишет по команде "объявление")
+
+# --- Магазин: часы работы по МСК ---
+STORE_OPEN_HOUR = 10
+STORE_CLOSE_HOUR = 22
+STORE_MANAGER = "@VoxTecn"
+
+# --- Награды за игровые нормы (начисляет только админ секретными командами) ---
+NORM_RANK_LP = 70              # норма ранга (Легендарный) — было 220
+NORM_TROPHY_LP = 70            # норма кубков — было 200
+
+# --- Система норм-кубков (Этап 5) ---
+WEEKLY_TROPHY_NORM = 1450      # сколько кубков надо набрать за неделю (Пн→Вс МСК)
+NORMS_START_DATE = "2026-06-22"  # нормы начинают считаться с этого понедельника (раньше — ничего)
+NORM_FAIL_PENALTY = 50         # штраф LP за невыполнение нормы кубков
+NORM_WARN_LIMIT = 3            # столько норм-варнов за NORM_WARN_DAYS → авто-исключение
+NORM_WARN_DAYS = 30            # срок жизни норм-варна (месяц)
+SOFT_START_WEEKS = 2           # «мягкий старт»: первые N недель нормы считаются, но без штрафов
+
+# Разовый бонус всем участникам за запуск «Цитадели» и терпение во время техработ (срабатывает 1 раз).
+CITADEL_BONUS_LP = 150
+
+# --- Документация и версия бота ---
+# Схема названий патчей: "LINKOR BOSS <версия> «<кодовое имя>»".
+# Кодовые имена — морская тематика (Линкор = боевой корабль). Названия придумывает Claude.
+BOT_FULL_NAME = "LINKOR BOSS"
+BOT_VERSION = "5.1"
+PATCH_CODE = "LB-5.1"
+PATCH_NAME = "Цитадель"        # патч 5.1 в рамках глобального обновления «Цитадель»
+PATCH_TYPE = "обновление"
+BOT_OWNER = "@yaukoshi_san"    # владелец и разработчик бота (ты)
+BOT_ADMIN = "@VoxTecn"         # админ бота / владелец чата
+RELEASE_DATE = "05.06.2026"
+
+# История изменений ДЛЯ УЧАСТНИКОВ по версиям (новые сверху). Без админских/секретных команд.
+# Формат: (версия, тип, [пункты])
+CHANGELOG_HISTORY = [
+    ("5.1", "обновление", [
+        "📲 Меню стало аккуратным: кнопки работают только у того, кто открыл меню, а разделы открываются прямо в том же сообщении — чат больше не засоряется.",
+        "⭐ Репутацию теперь можно не только повышать, но и понижать: ответь на сообщение знаком «-» (или «-rep»). Репутация может уходить в минус.",
+        "🤖 Помощник: если AI не ответил (лимит/связь), повтор разрешён уже через несколько секунд, а не через полминуты. Команды «факт/шутка/тост» стали легче.",
+        "📑 История изменений теперь в сворачиваемых цитатах — открывается по тапу, не засоряя чат.",
+        "📜 Соглашение: теперь принимается один раз — кнопки исчезают после выбора, повторно «принять/отказать» по кругу больше нельзя.",
+        "🔇 Длительность мута можно писать удобно: «30м» (минуты), «12ч» (часы), «7д» (дни) — не только в минутах.",
+        "🎮 Привязка тега стала защищённой: тег должен состоять в клубе LINKOR, а игровой ник — совпадать с твоей припиской «LT | ник» в чате. Чужой профиль привязать больше нельзя.",
+        "👤 В профиле вместо неточной даты вступления теперь рекорд серии дней.",
+        "👑 Зал славы прокачан: теперь это топы по LP, сообщениям, репутации и кубкам — соревнуйтесь за место среди легенд клана.",
+        "📋 До старта норм (22 июня) нормы больше не показываются в профиле и не начисляют LP — всё включится одновременно.",
+        "❓ Справка (help) стала кнопочным меню: разделы (профиль, клан, игры, AI, админ) открываются прямо в том же сообщении и сворачиваются — больше никакой стены текста на пол-чата.",
+        "⌨️ Команды теперь с точкой в начале: <code>.help</code>, <code>.profile</code>, <code>.Linkor вопрос</code>. Слово без точки командой не считается — бот больше не срабатывает случайно (например, от «linkor» в обычной речи). В личке точка необязательна.",
+    ]),
+    ("5.0", "глобальное обновление", [
+        "🎉 В честь запуска «Цитадели» и за терпение во время техработ — всем участникам разовый бонус +150 LP!",
+        "🏰 Стартовало большое обновление «Цитадель» — выходит этапами, фичи будут добавляться.",
+        "🔥 Ежедневный стрик: пиши в чат каждый день — за серии (3, 7, 14, 30… дней подряд) капают бонусные LP. Смотри командой «streak».",
+        "🏆 Топ по кубкам Brawl Stars — команда «top trophies» (нужен привязанный тег).",
+        "🗓 Сезоны: каждый месяц — отдельный топ активности. В конце месяца топ-3 получают LP и попадают в зал славы, топ обнуляется. Команды «season» и «hof».",
+        "📲 Кнопочное меню: команда «menu» — открывает разделы (профиль, магазин, топы, нормы…) кнопками, без ввода команд.",
+        "🛒 Магазин по кнопке: в «shop» теперь можно нажать на товар — оформится заявка, LP зарезервируются, а менеджер выдаст товар (или вернёт LP при отклонении).",
+        "🛡 Управление: журнал модерации («modlog»), опросы («poll»), сводная аналитика клана («analytics»), бэкап базы («backup»), кнопки «Одобрить/Отклонить» в обжалованиях и авто-защита от рейдов.",
+        "🏆 Нормы кубков: бот сам делает снимок кубков в понедельник и проверяет в воскресенье. Набрал +1450 за неделю → +70 LP; не набрал → −50 LP и норм-варн (3 за месяц = исключение). Первые 2 недели — мягкий старт без штрафов. Уехал отдыхать — админ ставит «отпуск».",
+        "📜 Согласие с правилами: новичок принимает соглашение в личке боту по кнопке. Без согласия бот недоступен (кроме владельца и админов).",
+        "🏷 Привязка тега обязательна для новичков: не привязал за 3 дня — авто-исключение. Старичков это правило не трогает.",
+        "🗓 Нормы кубков и активности начинают считаться с 22 июня 2026 — чтобы все спокойно вошли в ритм (особенно у кого экзамены).",
+        "💬 Норма активности (450 сообщений/нед) теперь тоже с проверкой: не выполнил — −50 LP и норм-варн (максимум один в неделю; 3 за месяц = исключение).",
+    ]),
+    ("4.9", "финальный патч перед 5.0", [
+        "🤖 Все команды бота теперь на английском (profile, lp, top, shop, norms…) — бот больше не срабатывает на обычные русские фразы в чате.",
+        "🛡 При снятии варна списанные за него LP теперь возвращаются игроку обратно.",
+        "📜 Появилось соглашение и FAQ — читается в личке боту командой «faq».",
+        "🪙 Баланс стал надёжнее: начисление LP больше не может «потеряться» технически.",
+        "💾 Все данные (баланс, репутация, привязанный тег, топы) сохраняются между обновлениями.",
+        "🎨 Финальная вычитка оформления перед большим релизом 5.0.",
+    ]),
+    ("4.8", "исправления оформления", [
+        "📅 В профиле убраны повторяющиеся значки: сообщения, день, неделя и стаж теперь разные иконки.",
+        "🛒 Порядок товаров в магазине исправлен: Brawl Pass → улучшение → Brawl Pass Plus → Pro Pass.",
+        "📊 Прогресс-бар теперь ведёт сначала к Brawl Pass (а не к улучшению, которое без BP не купить).",
+    ]),
+    ("4.7", "исправления", [
+        "🐞 Исправлена путаница в чатах с темами: бот больше не принимает тему за «ответ», поэтому LP начисляются и показываются правильному человеку.",
+        "🪙 Команда «lp» всегда показывает ТВОЙ баланс; чужой — по «lp @юзер».",
+        "👤 «profile» по умолчанию открывает твой профиль; чужой — по «profile @юзер».",
+        "🔧 Повышена точность и стабильность баланса, топов и репутации.",
+    ]),
+    ("4.6", "финальная полировка", [
+        "🎨 Полностью обновлённое премиум-оформление: все значки анимированы, единый дорогой стиль.",
+        "🎮 Привязка игрового тега Brawl Stars: бот видит твои кубки и трофейный рекорд (команда «tag»).",
+        "📅 Воскресный авто-отчёт по клану: топ активных за неделю и кто не дотянул норму.",
+        "🏅 Топы, профиль и модерация получили новые анимированные эмодзи.",
+    ]),
+    ("4.5", "крупная доработка", [
+        "📑 Документация хранит полную историю изменений по версиям.",
+        "🚫 Анти-спам: за длинную серию сообщений подряд LP больше не начисляются.",
+        "👤 Личный кабинет в ЛС: напиши боту «profile» — баланс, статистика и прогресс.",
+        "📊 В профиле появился прогресс-бар до следующей награды.",
+    ]),
+    ("4.1", "минорное обновление", [
+        "💬 Дневной потолок активности, баланс пересчитан — быть активным каждый день выгоднее.",
+        "⚖️ Обжалование наказаний: напиши боту в личку «appeal».",
+        "🛡 При снятии варна/мута и разбане можно указывать причину (например, амнистия).",
+        "📊 Топы и баланс LP сохраняются между обновлениями бота.",
+        "🤖 Помощник Linkor запоминает контекст диалога; факты и сводка лучше.",
+    ]),
+    ("4.0", "глобальное обновление", [
+        "💬 Новая система LP: баллы капают за каждое сообщение — чем активнее, тем больше.",
+        "🪙 LP стали дробными и начисляются плавно.",
+        "🎨 Полностью обновлённое премиум-оформление: анимированные эмодзи и новый стиль.",
+        "🛒 Переработан магазин: понятнее, как получать LP и что купить.",
+        "🧮 Исправлены ошибки в балансе и топах.",
+    ]),
+]
+
+# --- Автомодерация (прогрессивно, по кодексу) ---
+# Лестница: 1) устный выговор → 2) мут → 3) варн → 3 варна = исключение.
+DISCIPLINE_DECAY_DAYS = 7          # через сколько дней «чистого» поведения стадия сбрасывается
+MUTE_HOURS_INSULT = 6              # мут за оскорбления/мат (кодекс 1.1: 1–12 ч)
+MUTE_HOURS_CAPS = 2                # мут за КАПС (кодекс 1.10: 1–3 ч)
+MUTE_HOURS_FLOOD = 1               # мут за флуд (кодекс 1.8: 1–6 ч)
+
+FLOOD_LIMIT = 5                    # сообщений
+FLOOD_WINDOW = 7                   # за столько секунд
+CAPS_MIN_LEN = 12                  # длина, с которой проверяем КАПС
+CAPS_RATIO = 0.7
+REP_COOLDOWN_MIN = 60
+
+# Мат и крепкие словечки в чате РАЗРЕШЕНЫ — за обычную брань бот не наказывает.
+# Этот список по умолчанию ПУСТ. Сюда можно добавить слова, которые ты хочешь
+# блокировать ВСЕГДА (мгновенно, без AI), даже если это просто выражение.
+BANNED_WORDS = [
+]
+
+# ---------- AI (Cerebras — бесплатно, без карты, 1 млн токенов/день) ----------
+# Регистрация: cloud.cerebras.ai (email, без карты и без листа ожидания, ~5 минут).
+# Ключ создаётся в разделе API Keys. Лимиты бесплатно: 1 000 000 токенов/день,
+# 30 запросов/мин, 14 400 запросов/день, контекст до 8192 токенов. Очень быстро (2600+ ток/сек).
+# ВАЖНО: зарубежный сервис — запросы лучше с зарубежного IP (твой VPS); с ПК в РФ может нужен VPN.
+AI_API_KEY = os.environ.get("AI_API_KEY", "")   # из переменной окружения (bothost) или впиши в кавычки
+AI_BASE_URL = "https://api.cerebras.ai/v1"
+AI_MODEL = "gpt-oss-120b"          # сильная бесплатная модель; запасные: llama-3.3-70b
+                                   # актуальный список — в консоли cloud.cerebras.ai
+AI_MODERATION = False              # ВЫКЛ: проверка КАЖДОГО сообщения превышает лимит Cerebras (ошибки 429)
+                                   # и мешает ассистенту Linkor. Включай, только если будет платный/больший лимит.
+AI_MOD_AUTOPUNISH = True           # если AI_MODERATION включишь — нарушения пойдут по лестнице наказаний
+AI_COOLDOWN_SEC = 30               # пауза между AI-запросами (для команды Linkor)
+AI_RETRY_SEC = 8                   # если AI не ответил — даём повтор уже через столько секунд (не штрафуем полным кулдауном)
+
+# --- Brawl Stars API (привязка игрового тега) ---
+# Ключ создаётся на developer.brawlstars.com. На хостинге с «плавающим» IP используем
+# прокси RoyaleAPI: в кабинете Brawl впиши в whitelist IP 45.79.218.79, а ключ положи
+# в переменную окружения BRAWL_API_KEY. Без ключа функция тега просто отключена.
+BRAWL_API_KEY = os.environ.get("BRAWL_API_KEY", "")
+BRAWL_API_BASE = "https://bsproxy.royaleapi.dev/v1"   # прокси RoyaleAPI (фиксированный IP)
+BRAWL_CACHE_TTL = 600              # сколько секунд держать данные игрока в памяти
+LINKOR_CLUB_TAG = "2U80CYP9J"      # тег клуба LINKOR (без #): тег можно привязать только если игрок состоит в клубе
+TAG_VERIFY_BY_TITLE = True         # дополнительно сверять игровой ник с припиской «LT | ник» в чате
+# Примечание: Brawl-API не отдаёт ранговую лигу (Ranked) — её норму («Легендарная») проверяют вручную
+# командой «норма ранг». Бот автоматически следит только за приростом кубков (норма кубков).
+
+# Московское время (UTC+3, без перевода часов)
+MSK = timezone(timedelta(hours=3))
+
+# ------------------------------------------------------------
+# СТАРТОВЫЕ БАЛАНСЫ LP (из твоего списка).
+# Ключ — @username БЕЗ собачки, в любом регистре. LP начислятся,
+# как только человек напишет в чат. Можешь свободно редактировать.
+# ⚠️ Записи без @username (например "❄️Рейна ашот🧊" и "?") добавь
+#    вручную: ответь на сообщение человека и напиши "лп =140".
+# ------------------------------------------------------------
+# Старые начисления по @username больше не используются — у всех старт 100 LP.
+SEED_LP = {}
+
+# ------------------------------------------------------------
+# СТАРТОВЫЕ БАЛАНСЫ LP ПО ID (надёжнее, чем по @username).
+# Подходит для людей без юзернейма. Формат:  user_id: количество_LP
+# Балансы появятся сразу при запуске, даже до первого сообщения.
+# Существующие балансы НЕ перезаписываются (защита от случайной потери).
+# ------------------------------------------------------------
+SEED_LP_BY_ID = {
+    # Когда пришлёшь список "очки↔айди", проставь LP напротив нужных ID
+    # и убери # в начале строки. Пример:  1644726751: 500,
+    #
+    # --- Список ID участников чата (заготовка) ---
+    # 1644726751: 0,   # ты (Лидер)
+    # 5563767723: 0,
+    # 6381412181: 0,
+    # 485558746: 0,    # Админ
+    # 6978315935: 0,
+    # 44125359: 0,     # Админ2
+    # 6467563944: 0,
+    # 6556750104: 0,
+    # 5873356357: 0,
+    # 1601449534: 0,
+    # 8053010448: 0,
+    # 6354139019: 0,
+    # 6188088077: 0,
+    # 6662198472: 0,
+    # 7217527932: 0,
+    # 6127748766: 0,
+    # 7680788701: 0,
+    # 5377783977: 0,
+    # 1156680025: 0,
+    # 5226704708: 0,
+    # 8377662046: 0,
+    # 1582472561: 0,
+    # 5193879335: 0,
+    # 1652428291: 0,
+    # 8227895272: 0,
+    # 5800132769: 0,
+    # 8772020145: 0,
+    # 5228906058: 0,
+    # 2038946511: 0,
+    # 5639130526: 0,
+    # 2006050254: 0,
+    # 7732769013: 0,
+    # 7721750865: 0,
+}
+
+# ============================================================
+#                   РОЛИ И ПРАВА
+# ============================================================
+MEMBER, MANAGER, MODER, ADMIN, LEADER = 0, 1, 2, 3, 4
+ROLE_NAMES = {MEMBER: "Участник", MANAGER: "Менеджер", MODER: "Модератор",
+              ADMIN: "Администрация", LEADER: "Лидер"}
+ROLE_WORDS = {"участник": MEMBER, "юзер": MEMBER, "менеджер": MANAGER,
+              "модер": MODER, "модератор": MODER, "админ": ADMIN,
+              "администратор": ADMIN, "администрация": ADMIN, "лидер": LEADER}
+
+# Роли, выдаваемые автоматически при запуске (по ID). Удобно для админов,
+# которые не являются админами Telegram. Не понижает уже выданные роли.
+SEED_ROLES_BY_ID = {
+    1644726751: LEADER,    # ты — лидер клана
+    485558746: ADMIN,      # владелец чата (резерв на случай ЧП) + админ
+    44125359: ADMIN,       # Админ2
+}
+
+# ============================================================
+#                   БАЗА ДАННЫХ
+# ============================================================
+conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+conn.row_factory = sqlite3.Row
+# Надёжность базы: WAL переживает внезапные перезагрузки без потери данных,
+# foreign_keys и busy_timeout снижают риск ошибок при «занятой» базе.
+try:
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.commit()
+except Exception as e:
+    print(f"[DB] не удалось включить WAL: {e}", flush=True)
+
+
+def msk_now():
+    return datetime.now(MSK)
+
+
+def _add_col(table, col, decl):
+    cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    if col not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+
+
+def init_db():
+    conn.execute("""CREATE TABLE IF NOT EXISTS users (
+        chat_id INTEGER, user_id INTEGER, username TEXT, name TEXT,
+        gems INTEGER DEFAULT 0, reputation INTEGER DEFAULT 0,
+        mutes INTEGER DEFAULT 0, role INTEGER DEFAULT 0,
+        joined TEXT, last_rep TEXT, lp INTEGER DEFAULT 0,
+        PRIMARY KEY (chat_id, user_id))""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS warns (
+        chat_id INTEGER, user_id INTEGER, ts TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS stats (
+        chat_id INTEGER, user_id INTEGER, day TEXT, cnt INTEGER DEFAULT 0,
+        PRIMARY KEY (chat_id, user_id, day))""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS lp_log (
+        chat_id INTEGER, user_id INTEGER, day TEXT, delta INTEGER)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS pending_lp (
+        username TEXT PRIMARY KEY, amount INTEGER)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS hall_of_fame (
+        chat_id INTEGER, season TEXT, rank INTEGER, user_id INTEGER,
+        name TEXT, score INTEGER, ts TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, user_id INTEGER,
+        name TEXT, item TEXT, price INTEGER, status TEXT DEFAULT 'pending', ts TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS modlog (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, admin_id INTEGER, admin_name TEXT,
+        target_id INTEGER, target_name TEXT, action TEXT, reason TEXT, ts TEXT)""")
+    _add_col("users", "lp", "INTEGER DEFAULT 0")
+    _add_col("users", "norm_week", "TEXT")
+    _add_col("users", "super_week", "TEXT")
+    _add_col("users", "earn_week", "TEXT")
+    _add_col("users", "earn_amt", "INTEGER DEFAULT 0")
+    _add_col("users", "disc_stage", "INTEGER DEFAULT 0")
+    _add_col("users", "disc_last", "TEXT")
+    _add_col("users", "brawl_tag", "TEXT")
+    _add_col("users", "brawl_trophies", "INTEGER")     # последние известные кубки (для топа)
+    _add_col("users", "brawl_name", "TEXT")            # имя в Brawl Stars
+    _add_col("users", "streak", "INTEGER DEFAULT 0")   # текущая серия дней подряд
+    _add_col("users", "streak_last", "TEXT")           # дата последнего чек-ина (МСК, YYYY-MM-DD)
+    _add_col("users", "streak_best", "INTEGER DEFAULT 0")  # рекорд серии
+    _add_col("users", "trophy_base", "INTEGER")            # кубки на начало недели (снимок)
+    _add_col("users", "trophy_base_week", "TEXT")          # понедельник недели снимка (YYYY-MM-DD)
+    _add_col("users", "vacation_until", "TEXT")            # «отпуск» от норм до этой даты (YYYY-MM-DD)
+    _add_col("users", "norm_anchor_week", "TEXT")          # понедельник недели, на начало которой участник был в клане
+    _add_col("users", "agreed_faq", "INTEGER DEFAULT 0")   # принял ли соглашение (по кнопке в ЛС)
+    _add_col("users", "tag_gate", "INTEGER DEFAULT 0")     # 1 = новичок, обязан привязать тег
+    _add_col("users", "tag_warns", "INTEGER DEFAULT 0")    # счётчик тег-варнов (нет тега)
+    _add_col("users", "tag_warn_last", "TEXT")             # дата последнего тег-варна (YYYY-MM-DD)
+    conn.execute("""CREATE TABLE IF NOT EXISTS norm_warns (
+        chat_id INTEGER, user_id INTEGER, ts TEXT)""")
+    conn.commit()
+    load_seed()
+    load_seed_by_id()
+    load_roles_by_id()
+    reset_balances()
+
+
+def reset_balances():
+    """Разовый сброс: всем 100 LP, лидеру максимум, исключённым админам 0."""
+    if not ALLOWED_CHAT_ID:
+        return
+    if conn.execute("SELECT 1 FROM meta WHERE key='reset_done'").fetchone():
+        return
+    conn.execute("UPDATE users SET lp=? WHERE chat_id=?", (STARTING_LP, ALLOWED_CHAT_ID))
+    conn.execute("UPDATE users SET lp=? WHERE chat_id=? AND user_id=?", (LP_MAX, ALLOWED_CHAT_ID, LEADER_ID))
+    for uid in EXCLUDED_IDS:
+        conn.execute("UPDATE users SET lp=0 WHERE chat_id=? AND user_id=?", (ALLOWED_CHAT_ID, uid))
+    conn.execute("DELETE FROM pending_lp")
+    conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('reset_done','1')")
+    conn.commit()
+
+
+def load_roles_by_id():
+    """Назначает роли по ID при запуске. Не понижает уже выданные роли."""
+    if not ALLOWED_CHAT_ID:
+        return
+    for uid, role in SEED_ROLES_BY_ID.items():
+        row = get_user(ALLOWED_CHAT_ID, uid)
+        if row is None:
+            conn.execute(
+                "INSERT OR IGNORE INTO users (chat_id,user_id,username,name,joined,lp,role) VALUES (?,?,?,?,?,0,?)",
+                (ALLOWED_CHAT_ID, uid, "", "", msk_now().isoformat(), role))
+        elif row["role"] < role:
+            conn.execute("UPDATE users SET role=? WHERE chat_id=? AND user_id=?",
+                         (role, ALLOWED_CHAT_ID, uid))
+    conn.commit()
+
+
+def load_seed_by_id():
+    """Заносит стартовые LP по ID. Не трогает уже существующие записи."""
+    if not ALLOWED_CHAT_ID:
+        return
+    for uid, amt in SEED_LP_BY_ID.items():
+        amt = max(0, min(LP_MAX, int(amt)))
+        conn.execute(
+            "INSERT OR IGNORE INTO users (chat_id,user_id,username,name,joined,lp) VALUES (?,?,?,?,?,?)",
+            (ALLOWED_CHAT_ID, uid, "", "", msk_now().isoformat(), amt))
+    conn.commit()
+
+
+def load_seed():
+    if conn.execute("SELECT 1 FROM meta WHERE key='seed_done'").fetchone():
+        return
+    for uname, amt in SEED_LP.items():
+        conn.execute("INSERT OR IGNORE INTO pending_lp (username, amount) VALUES (?,?)",
+                     (uname.lower(), amt))
+    conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('seed_done','1')")
+    conn.commit()
+
+
+def ensure_user(chat_id, user):
+    row = conn.execute("SELECT 1 FROM users WHERE chat_id=? AND user_id=?",
+                       (chat_id, user.id)).fetchone()
+    if row is None:
+        start_lp = 0 if user.id in EXCLUDED_IDS else STARTING_LP
+        conn.execute(
+            "INSERT INTO users (chat_id,user_id,username,name,joined,lp) VALUES (?,?,?,?,?,?)",
+            (chat_id, user.id, user.username or "", user.full_name, msk_now().isoformat(), start_lp))
+    else:
+        conn.execute("UPDATE users SET username=?, name=? WHERE chat_id=? AND user_id=?",
+                     (user.username or "", user.full_name, chat_id, user.id))
+    conn.commit()
+    credit_pending(chat_id, user)
+
+
+def credit_pending(chat_id, user):
+    if not user.username:
+        return
+    row = conn.execute("SELECT amount FROM pending_lp WHERE username=?",
+                       (user.username.lower(),)).fetchone()
+    if row:
+        add_lp(chat_id, user.id, row[0])
+        conn.execute("DELETE FROM pending_lp WHERE username=?", (user.username.lower(),))
+        conn.commit()
+
+
+def get_user(chat_id, user_id):
+    return conn.execute("SELECT * FROM users WHERE chat_id=? AND user_id=?",
+                        (chat_id, user_id)).fetchone()
+
+
+def set_lp(chat_id, user_id, value):
+    if user_id in EXCLUDED_IDS:                      # админы вне экономики: всегда 0
+        conn.execute("INSERT INTO users (chat_id,user_id,lp) VALUES (?,?,0) "
+                     "ON CONFLICT(chat_id,user_id) DO UPDATE SET lp=0", (chat_id, user_id))
+        conn.commit()
+        return 0
+    value = max(LP_MIN, min(LP_MAX, round(float(value), 2)))   # от -10000 до +10000, дробные
+    # UPSERT: если строки игрока ещё нет — создаём, чтобы начисление никогда не терялось
+    conn.execute("INSERT INTO users (chat_id,user_id,lp) VALUES (?,?,?) "
+                 "ON CONFLICT(chat_id,user_id) DO UPDATE SET lp=excluded.lp", (chat_id, user_id, value))
+    conn.commit()
+    return value
+
+
+def add_lp(chat_id, user_id, delta):
+    row = get_user(chat_id, user_id)
+    cur = row["lp"] if row else 0
+    new = set_lp(chat_id, user_id, cur + delta)
+    applied = new - cur
+    if abs(delta) >= 1:   # ручные начисления логируем (мелкие +0.05 за сообщения — нет, чтобы не засорять)
+        print(f"[LP] chat={chat_id} user={user_id}: {fmt_lp(cur)} {'+' if delta>=0 else ''}{delta} -> {fmt_lp(new)}", flush=True)
+    if applied != 0:
+        conn.execute("INSERT INTO lp_log (chat_id,user_id,day,delta) VALUES (?,?,?,?)",
+                     (chat_id, user_id, today_str(), applied))
+        conn.commit()
+    return new
+
+
+def lp_earned(chat_id, user_id, period):
+    """Сколько LP получено за 'day' или 'week'."""
+    if period == "day":
+        return conn.execute("SELECT COALESCE(SUM(delta),0) FROM lp_log WHERE chat_id=? AND user_id=? AND day=?",
+                            (chat_id, user_id, today_str())).fetchone()[0]
+    mon, sun = week_bounds()
+    return conn.execute("SELECT COALESCE(SUM(delta),0) FROM lp_log WHERE chat_id=? AND user_id=? AND day BETWEEN ? AND ?",
+                        (chat_id, user_id, mon, sun)).fetchone()[0]
+
+
+def award_lp_capped(chat_id, user_id, amount):
+    """Начисляет LP с учётом НЕДЕЛЬНОГО ЛИМИТА заработка. Возвращает (сколько_выдано, баланс).
+    Ручные начисления админа (команда «lp») идут мимо лимита."""
+    if LP_WEEKLY_CAP <= 0:
+        return amount, add_lp(chat_id, user_id, amount)
+    mon, _ = week_bounds()
+    row = get_user(chat_id, user_id)
+    earned = (row["earn_amt"] if (row and row["earn_week"] == mon) else 0) or 0
+    room = max(0, LP_WEEKLY_CAP - earned)
+    give = round(min(amount, room), 2)
+    if give <= 0:
+        return 0, (row["lp"] if row else 0)
+    bal = add_lp(chat_id, user_id, give)
+    conn.execute("UPDATE users SET earn_week=?, earn_amt=? WHERE chat_id=? AND user_id=?",
+                 (mon, round(earned + give, 2), chat_id, user_id))
+    conn.commit()
+    return give, bal
+
+
+def get_role(chat_id, user_id):
+    row = get_user(chat_id, user_id)
+    return row["role"] if row else MEMBER
+
+
+def set_role(chat_id, user_id, role):
+    conn.execute("UPDATE users SET role=? WHERE chat_id=? AND user_id=?", (role, chat_id, user_id))
+    conn.commit()
+
+
+def inc_mutes(chat_id, user_id):
+    conn.execute("UPDATE users SET mutes=mutes+1 WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+    conn.commit()
+
+
+def _prune_warns(chat_id, user_id):
+    limit = (msk_now() - timedelta(days=WARN_LIFETIME_DAYS)).isoformat()
+    conn.execute("DELETE FROM warns WHERE chat_id=? AND user_id=? AND ts<?",
+                 (chat_id, user_id, limit))
+    conn.commit()
+
+
+def add_warn(chat_id, user_id):
+    _prune_warns(chat_id, user_id)
+    conn.execute("INSERT INTO warns (chat_id,user_id,ts) VALUES (?,?,?)",
+                 (chat_id, user_id, msk_now().isoformat()))
+    conn.commit()
+    return count_warns(chat_id, user_id)
+
+
+def count_norm_warns(chat_id, user_id):
+    """Активные норм-варны за последние NORM_WARN_DAYS дней."""
+    limit = (msk_now() - timedelta(days=NORM_WARN_DAYS)).isoformat()
+    conn.execute("DELETE FROM norm_warns WHERE chat_id=? AND user_id=? AND ts<?", (chat_id, user_id, limit))
+    conn.commit()
+    return conn.execute("SELECT COUNT(*) FROM norm_warns WHERE chat_id=? AND user_id=?", (chat_id, user_id)).fetchone()[0]
+
+
+def add_norm_warn(chat_id, user_id):
+    conn.execute("INSERT INTO norm_warns (chat_id,user_id,ts) VALUES (?,?,?)", (chat_id, user_id, msk_now().isoformat()))
+    conn.commit()
+    return count_norm_warns(chat_id, user_id)
+
+
+def on_vacation(row):
+    """True, если у участника действует «отпуск» от норм."""
+    try:
+        vu = row["vacation_until"] if row and "vacation_until" in row.keys() else None
+        return bool(vu) and vu >= today_str()
+    except Exception:
+        return False
+
+
+def norms_launch_monday():
+    """Понедельник, с которого начинают считаться нормы (фиксированная дата старта)."""
+    return NORMS_START_DATE
+
+
+def soft_start_active():
+    """True в первые SOFT_START_WEEKS недель после старта норм — штрафы не применяются."""
+    try:
+        launch = datetime.fromisoformat(norms_launch_monday()).date()
+        return msk_now().date() < launch + timedelta(weeks=SOFT_START_WEEKS)
+    except Exception:
+        return False
+
+
+def count_warns(chat_id, user_id):
+    _prune_warns(chat_id, user_id)
+    return conn.execute("SELECT COUNT(*) FROM warns WHERE chat_id=? AND user_id=?",
+                        (chat_id, user_id)).fetchone()[0]
+
+
+def remove_one_warn(chat_id, user_id):
+    row = conn.execute("SELECT rowid FROM warns WHERE chat_id=? AND user_id=? ORDER BY ts DESC LIMIT 1",
+                       (chat_id, user_id)).fetchone()
+    if row:
+        conn.execute("DELETE FROM warns WHERE rowid=?", (row[0],))
+        conn.commit()
+    return count_warns(chat_id, user_id)
+
+
+def clear_warns(chat_id, user_id):
+    conn.execute("DELETE FROM warns WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+    conn.commit()
+
+
+def today_str():
+    return msk_now().strftime("%Y-%m-%d")
+
+
+def week_bounds():
+    now = msk_now()
+    monday = (now - timedelta(days=now.weekday())).date()
+    sunday = monday + timedelta(days=6)
+    return monday.isoformat(), sunday.isoformat()
+
+
+def touch_streak(chat_id, user):
+    """Отмечает ежедневный чек-ин при ПЕРВОМ сообщении за день (МСК).
+    Возвращает (новая_серия, бонус_LP) если сегодня отметился впервые, иначе None."""
+    row = get_user(chat_id, user.id)
+    if not row:
+        return None
+    today = msk_now().date()
+    last = row["streak_last"] if "streak_last" in row.keys() else None
+    if last == today.isoformat():
+        return None                                  # уже отмечался сегодня
+    yesterday = (today - timedelta(days=1)).isoformat()
+    new_streak = (row["streak"] or 0) + 1 if last == yesterday else 1
+    best = max(row["streak_best"] or 0, new_streak)
+    conn.execute("UPDATE users SET streak=?, streak_last=?, streak_best=? WHERE chat_id=? AND user_id=?",
+                 (new_streak, today.isoformat(), best, chat_id, user.id))
+    conn.commit()
+    bonus = STREAK_MILESTONES.get(new_streak, 0)
+    if bonus and user.id not in EXCLUDED_IDS:
+        add_lp(chat_id, user.id, bonus)
+    return new_streak, bonus
+
+
+def meta_get(key):
+    r = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return r[0] if r else None
+
+
+def meta_set(key, value):
+    conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, str(value)))
+    conn.commit()
+
+
+MONTHS_RU = ["", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+             "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
+
+
+def current_season():
+    return msk_now().strftime("%Y-%m")
+
+
+def season_title(season):
+    """'2026-06' -> 'Июнь 2026'."""
+    try:
+        y, m = season.split("-")
+        return f"{MONTHS_RU[int(m)]} {y}"
+    except Exception:
+        return season
+
+
+def season_days_left():
+    now = msk_now()
+    nxt = now.replace(year=now.year + 1, month=1, day=1) if now.month == 12 else now.replace(month=now.month + 1, day=1)
+    return (nxt.date() - now.date()).days
+
+
+def season_top(chat_id, season, limit=10):
+    """Топ участников по числу сообщений за месяц season ('YYYY-MM'). Без админов вне экономики."""
+    excl = tuple(EXCLUDED_IDS) or (0,)
+    ph = ",".join("?" * len(excl))
+    return conn.execute(
+        f"SELECT u.name, u.user_id, COALESCE(SUM(s.cnt),0) AS val FROM users u "
+        f"LEFT JOIN stats s ON s.chat_id=u.chat_id AND s.user_id=u.user_id AND s.day LIKE ? "
+        f"WHERE u.chat_id=? AND u.user_id NOT IN ({ph}) GROUP BY u.user_id ORDER BY val DESC LIMIT ?",
+        (f"{season}-%", chat_id, *excl, limit)).fetchall()
+
+
+def stat_add(chat_id, user_id):
+    conn.execute(
+        "INSERT INTO stats (chat_id,user_id,day,cnt) VALUES (?,?,?,1) "
+        "ON CONFLICT(chat_id,user_id,day) DO UPDATE SET cnt=cnt+1",
+        (chat_id, user_id, today_str()))
+    conn.commit()
+
+
+def stat_today(chat_id, user_id):
+    r = conn.execute("SELECT cnt FROM stats WHERE chat_id=? AND user_id=? AND day=?",
+                     (chat_id, user_id, today_str())).fetchone()
+    return r[0] if r else 0
+
+
+def stat_week(chat_id, user_id):
+    mon, sun = week_bounds()
+    return conn.execute("SELECT COALESCE(SUM(cnt),0) FROM stats WHERE chat_id=? AND user_id=? AND day BETWEEN ? AND ?",
+                        (chat_id, user_id, mon, sun)).fetchone()[0]
+
+
+def stat_total(chat_id, user_id):
+    return conn.execute("SELECT COALESCE(SUM(cnt),0) FROM stats WHERE chat_id=? AND user_id=?",
+                        (chat_id, user_id)).fetchone()[0]
+
+
+def norm_reward_due(chat_id, user_id):
+    """True, если норма выполнена и LP за неё на этой неделе ещё не выдавались."""
+    if WEEKLY_MSG_NORM <= 0 or user_id in EXCLUDED_IDS:
+        return False
+    if stat_week(chat_id, user_id) < WEEKLY_MSG_NORM:
+        return False
+    mon, _ = week_bounds()
+    row = get_user(chat_id, user_id)
+    return not (row and row["norm_week"] == mon)
+
+
+def mark_norm(chat_id, user_id):
+    mon, _ = week_bounds()
+    conn.execute("UPDATE users SET norm_week=? WHERE chat_id=? AND user_id=?", (mon, chat_id, user_id))
+    conn.commit()
+
+
+def super_reward_due(chat_id, user_id):
+    """True, если набран сверх-порог сообщений и бонус на этой неделе ещё не выдан."""
+    if SUPER_NORM_MSGS <= 0 or user_id in EXCLUDED_IDS:
+        return False
+    if stat_week(chat_id, user_id) < SUPER_NORM_MSGS:
+        return False
+    mon, _ = week_bounds()
+    row = get_user(chat_id, user_id)
+    return not (row and row["super_week"] == mon)
+
+
+def mark_super(chat_id, user_id):
+    mon, _ = week_bounds()
+    conn.execute("UPDATE users SET super_week=? WHERE chat_id=? AND user_id=?", (mon, chat_id, user_id))
+    conn.commit()
+
+
+# ============================================================
+#                   ВСПОМОГАТЕЛЬНОЕ
+# ============================================================
+def esc(s):
+    return html.escape(str(s or ""))
+
+
+def pe(name):
+    """Премиум-эмодзи по имени из PREMIUM_EMOJI. Возвращает HTML <tg-emoji> или запасной смайлик."""
+    item = PREMIUM_EMOJI.get(name)
+    if not item:
+        return ""
+    eid, fb = item
+    if PREMIUM_EMOJI_ENABLED and eid:
+        return f'<tg-emoji emoji-id="{eid}">{fb}</tg-emoji>'
+    return fb
+
+
+# Обычные эмодзи -> имя премиум-эмодзи (для авто-замены в истории изменений и т.п.)
+_PLAIN_TO_PREMIUM = {
+    "🎨": "star", "🎮": "game", "📅": "calendar", "🏅": "cup", "📑": "folder",
+    "🚫": "cross", "👤": "person", "📊": "stats", "💬": "msg", "⚖️": "scales",
+    "⚖": "scales", "🛡": "shield", "🤖": "robot", "🪙": "lp", "🛒": "shop",
+    "🧮": "stats", "🐞": "check", "💾": "folder", "📜": "scroll", "🔧": "shield",
+    "🚀": "growth", "🔥": "fire", "⭐": "star", "🏆": "cup", "📌": "pin",
+}
+
+
+def premiumize(text):
+    """Заменяет обычные эмодзи в тексте на премиум-версии (где есть соответствие)."""
+    for plain, nm in _PLAIN_TO_PREMIUM.items():
+        if plain in text:
+            text = text.replace(plain, pe(nm))
+    return text
+
+
+def fmt_lp(v):
+    """Красиво показывает LP: целые без точки (120), дробные с нужными знаками (12.4)."""
+    try:
+        v = round(float(v or 0), 2)
+    except (TypeError, ValueError):
+        return "0"
+    if v == int(v):
+        return str(int(v))
+    return f"{v:.2f}".rstrip("0").rstrip(".")
+
+
+def fmt_num(n):
+    """Число с разделителями тысяч: 45000 -> 45 000."""
+    try:
+        return f"{int(n):,}".replace(",", " ")
+    except (TypeError, ValueError):
+        return str(n)
+
+
+def _days_word(n):
+    """Склонение: 1 день, 2 дня, 5 дней."""
+    n = abs(int(n))
+    if 11 <= n % 100 <= 14:
+        return "дней"
+    d = n % 10
+    if d == 1:
+        return "день"
+    if 2 <= d <= 4:
+        return "дня"
+    return "дней"
+
+
+# Вехи прогресс-бара (по логике покупки, а не по цене): сначала Brawl Pass.
+# «Улучшение до BP+» не веха — это докупка к уже имеющемуся Brawl Pass.
+STORE_REWARDS = [(850, "Brawl Pass"), (1650, "Brawl Pass Plus"), (2800, "Pro Pass")]
+
+# Товары для покупки по кнопке: (ключ, название, цена в LP, имя премиум-эмодзи).
+STORE_ITEMS = [
+    ("bp", "Brawl Pass", 850, "bp"),
+    ("bpup", "Улучшение до Brawl Pass Plus", 750, "bpup"),
+    ("bpplus", "Brawl Pass Plus", 1650, "bpplus"),
+    ("pro", "Pro Pass", 2800, "pro"),
+]
+STORE_ITEMS_BY_KEY = {k: (k, n, p, e) for (k, n, p, e) in STORE_ITEMS}
+# Кто принимает/выдаёт заказы (получает заявки в ЛС): владелец + менеджер магазина.
+STORE_ADMINS = {LEADER_ID, 485558746}
+
+
+def next_reward(lp):
+    """Ближайшая награда, до которой ещё не хватает LP. None — если на всё уже хватает."""
+    for cost, nm in STORE_REWARDS:
+        if lp < cost:
+            return cost, nm
+    return None
+
+
+def progress_bar(current, target, width=10):
+    """Текстовый прогресс-бар: ▰▰▰▱▱▱▱▱▱▱"""
+    if target <= 0:
+        target = 1
+    filled = max(0, min(width, round(current / target * width)))
+    return "▰" * filled + "▱" * (width - filled)
+
+
+def progress_line(lp):
+    """Строка прогресса до ближайшей награды (или сообщение, что на всё хватает)."""
+    lp = max(0, lp)
+    nr = next_reward(lp)
+    if not nr:
+        return f"{pe('cup')} На все товары STORE уже хватает!"
+    cost, nm = nr
+    pct = int(min(100, lp / cost * 100))
+    return (f"{pe('star')} До «{nm}»: <b>{fmt_lp(max(0, cost - lp))}</b> LP\n"
+            f"{progress_bar(lp, cost)} {pct}%")
+
+
+# ============================================================
+#                   BRAWL STARS API (привязка тега)
+# ============================================================
+_brawl_cache = {}                  # TAG -> (данные, время)
+BRAWL_TAG_RE = re.compile(r"[0289PYLQGRJCUV]{3,12}")
+
+
+async def brawl_fetch(tag):
+    """Запрос данных игрока Brawl Stars (через прокси RoyaleAPI). None при ошибке/без ключа."""
+    if not BRAWL_API_KEY:
+        return None
+    t = (tag or "").strip().upper().lstrip("#")
+    url = f"{BRAWL_API_BASE}/players/%23{t}"
+    headers = {"Authorization": f"Bearer {BRAWL_API_KEY}", "Accept": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(url, headers=headers)
+        if r.status_code == 200:
+            data = r.json()
+            _brawl_cache[t] = (data, time.time())
+            return data
+        print(f"[BRAWL] HTTP {r.status_code} для тега #{t}", flush=True)
+    except Exception as e:
+        print(f"[BRAWL] ошибка запроса: {e}", flush=True)
+    return None
+
+
+def brawl_cached(tag):
+    item = _brawl_cache.get((tag or "").strip().upper().lstrip("#"))
+    if item and (time.time() - item[1] < BRAWL_CACHE_TTL):
+        return item[0]
+    return None
+
+
+def brawl_profile_line(chat_id, user_id):
+    """Строка с тегом для профиля (кэш или последние сохранённые кубки)."""
+    row = get_user(chat_id, user_id)
+    tag = (row["brawl_tag"] if row and "brawl_tag" in row.keys() else None)
+    if not tag:
+        return ""
+    data = brawl_cached(tag)
+    trophies = data.get("trophies", 0) if data else (row["brawl_trophies"] if (row and "brawl_trophies" in row.keys()) else 0)
+    highest = data.get("highestTrophies", 0) if data else 0
+    line = (f"\n\n<blockquote>{pe('game')} <b>Brawl Stars</b> · #{esc(tag)}\n"
+            f"{pe('cup')} Кубки: <b>{fmt_num(trophies)}</b>")
+    if highest:
+        line += f" · рекорд <b>{fmt_num(highest)}</b>"
+    line += "</blockquote>"
+    return line
+
+
+def brawl_card(data, tag, bound=False):
+    name = esc(data.get("name", "?"))
+    club = data.get("club") or {}
+    club_name = esc(club.get("name")) if club.get("name") else "—"
+    head = f"{pe('check')} <b>Тег привязан!</b>" if bound else f"{pe('game')} <b>ПРОФИЛЬ BRAWL STARS</b>"
+    norm_note = (f"\n<i>Следи за нормой клана: прирост +{WEEKLY_TROPHY_NORM} кубков в неделю.</i>"
+                 if today_str() >= NORMS_START_DATE else "")
+    return (f"{head}\n{CLAN_LINE}\n"
+            f"{pe('game')} <b>{name}</b> · #{esc(tag)}\n"
+            f"<blockquote>{pe('cup')} Кубки: <b>{fmt_num(data.get('trophies', 0))}</b>\n"
+            f"{pe('star')} Рекорд кубков: <b>{fmt_num(data.get('highestTrophies', 0))}</b>\n"
+            f"{pe('crown')} Уровень: <b>{data.get('expLevel', '?')}</b>\n"
+            f"{pe('shield')} Клуб: <b>{club_name}</b></blockquote>{norm_note}")
+
+
+def _norm_nick(s):
+    """Нормализует ник для сравнения: нижний регистр, только буквы/цифры (срезает пробелы, эмодзи, знаки)."""
+    return re.sub(r"[^0-9a-zа-яё]+", "", (s or "").lower())
+
+
+def _nick_from_title(title):
+    """Достаёт игровой ник из приписки в чате: 'LT | babah' -> 'babah'."""
+    if not title:
+        return ""
+    return re.split(r"[|:/\\]", title)[-1].strip()
+
+
+async def member_custom_title(context, user_id):
+    """Кастомный титул (приписка) участника в чате клана — есть только у админов. '' если нет/ошибка."""
+    try:
+        m = await context.bot.get_chat_member(ALLOWED_CHAT_ID, user_id)
+        return getattr(m, "custom_title", "") or ""
+    except Exception:
+        return ""
+
+
+async def cmd_brawl(update, context, parts):
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if not BRAWL_API_KEY:
+        await update.message.reply_text(
+            f"{pe('game')} Привязка тега скоро заработает — функция ещё настраивается администрацией.",
+            parse_mode=ParseMode.HTML)
+        return True
+    # с аргументом → привязать тег
+    if len(parts) > 1:
+        tag = parts[1].strip().upper().lstrip("#")
+        if not BRAWL_TAG_RE.fullmatch(tag):
+            await update.message.reply_text(
+                "Похоже, тег неверный. Пример: <code>.tag #2PP0LC</code> — тег виден в профиле игры под именем.",
+                parse_mode=ParseMode.HTML)
+            return True
+        await context.bot.send_chat_action(chat_id, "typing")
+        data = await brawl_fetch(tag)
+        if not data:
+            await update.message.reply_text(
+                "Не нашёл такого игрока 😕 Проверь тег (он в профиле Brawl Stars, начинается с #).")
+            return True
+        ensure_user(chat_id, user)
+        # --- Проверки владения тегом (владелец клана — без проверок) ---
+        if user.id != LEADER_ID:
+            # 1) тег должен состоять в клубе LINKOR (отсекает чужие/про-аккаунты)
+            club_tag = ((data.get("club") or {}).get("tag") or "").upper().lstrip("#")
+            if LINKOR_CLUB_TAG and club_tag != LINKOR_CLUB_TAG:
+                await update.message.reply_text(
+                    f"{pe('cross')} Этот тег <b>не состоит в клубе {CLAN_NAME}</b> в игре. "
+                    f"Привязать можно только свой аккаунт, который сейчас в клубе — вступи в клуб и попробуй снова.",
+                    parse_mode=ParseMode.HTML)
+                return True
+            # 2) игровой ник должен совпадать с твоей припиской «LT | ник» в чате (отсекает чужой тег своего клана)
+            if TAG_VERIFY_BY_TITLE:
+                nick = _nick_from_title(await member_custom_title(context, user.id))
+                gname = data.get("name") or ""
+                if nick and _norm_nick(nick) != _norm_nick(gname):
+                    await update.message.reply_text(
+                        f"{pe('cross')} Игровой ник аккаунта (<b>{esc(gname)}</b>) не совпадает с твоей "
+                        f"припиской в чате (<b>{esc(nick)}</b>). Привязать можно только <b>свой</b> профиль.\n"
+                        f"Если ник в игре изменился — попроси администратора обновить твою приписку.",
+                        parse_mode=ParseMode.HTML)
+                    return True
+        conn.execute("UPDATE users SET brawl_tag=?, brawl_trophies=?, brawl_name=?, tag_warns=0, tag_warn_last=NULL WHERE chat_id=? AND user_id=?",
+                     (tag, int(data.get("trophies", 0)), data.get("name"), chat_id, user.id))
+        conn.commit()
+        await update.message.reply_text(brawl_card(data, tag, bound=True), parse_mode=ParseMode.HTML)
+        return True
+    # без аргумента → показать свой
+    row = get_user(chat_id, user.id)
+    tag = row["brawl_tag"] if (row and "brawl_tag" in row.keys()) else None
+    if not tag:
+        await update.message.reply_text(
+            f"{pe('game')} У тебя не привязан игровой тег. Привяжи: <code>.tag #ТВОЙТЕГ</code> "
+            f"(тег виден в профиле Brawl Stars под именем).", parse_mode=ParseMode.HTML)
+        return True
+    await context.bot.send_chat_action(chat_id, "typing")
+    data = await brawl_fetch(tag) or brawl_cached(tag)
+    if not data:
+        await update.message.reply_text("Не получилось получить данные сейчас, попробуй позже.")
+        return True
+    conn.execute("UPDATE users SET brawl_trophies=?, brawl_name=? WHERE chat_id=? AND user_id=?",
+                 (int(data.get("trophies", 0)), data.get("name"), chat_id, user.id))
+    conn.commit()
+    await update.message.reply_text(brawl_card(data, tag, bound=False), parse_mode=ParseMode.HTML)
+    return True
+
+
+def mention(user):
+    """HTML-упоминание, которое пингует участника (работает даже без @юзернейма)."""
+    name = esc(getattr(user, "full_name", None) or getattr(user, "first_name", None) or "участник")
+    return f'<a href="tg://user?id={user.id}">{name}</a>'
+
+
+# Подмена латиницы/цифр на похожие кириллические буквы (обход фильтра вида "пид0р", "xуй")
+_LEET = str.maketrans({
+    "a": "а", "e": "е", "o": "о", "p": "р", "c": "с", "y": "у", "x": "х", "k": "к",
+    "b": "б", "m": "м", "h": "н", "t": "т", "0": "о", "3": "з", "4": "ч", "6": "б",
+    "@": "а", "$": "с", "1": "и",
+})
+
+
+def normalize_text(t):
+    """Приводит к нижнему регистру, заменяет латиницу/цифры и убирает все не-буквы."""
+    t = t.lower().translate(_LEET)
+    return "".join(ch for ch in t if ch.isalpha())
+
+
+def has_banned(text):
+    norm = normalize_text(text)
+    return any(w in norm for w in BANNED_WORDS)
+
+
+def real_reply(msg):
+    """Возвращает сообщение-ответ ТОЛЬКО если это настоящий ответ пользователя.
+    В форум-топиках «ответом» считается корневое сообщение темы (message_thread_id),
+    хотя человек никому не отвечал — такой авто-ответ игнорируем, иначе бот путает,
+    кому начислять LP и чей баланс показывать."""
+    if not msg:
+        return None
+    r = getattr(msg, "reply_to_message", None)
+    if not r:
+        return None
+    tid = getattr(msg, "message_thread_id", None)
+    if tid and getattr(r, "message_id", None) == tid:
+        return None                      # это привязка к корню темы, а не ответ
+    if getattr(r, "forum_topic_created", None):
+        return None                      # ответ на служебное сообщение создания темы
+    return r
+
+
+def target_user(update):
+    r = real_reply(update.message)
+    return r.from_user if r else None
+
+
+def resolve_target(update, parts):
+    """Находит участника: по НАСТОЯЩЕМУ ответу, по @юзернейму или по ID (из базы бота)."""
+    msg = update.message
+    rr = real_reply(msg)
+    if rr:
+        return rr.from_user
+    chat_id = update.effective_chat.id
+    for p in parts[1:]:
+        if p.startswith("@") and len(p) > 1:
+            row = conn.execute("SELECT user_id, username, name FROM users WHERE chat_id=? AND lower(username)=?",
+                               (chat_id, p[1:].lower())).fetchone()
+            if row:
+                return SimpleNamespace(id=row["user_id"], username=row["username"],
+                                       full_name=row["name"] or f"@{row['username']}")
+            return None
+        if p.isdigit():
+            row = conn.execute("SELECT user_id, username, name FROM users WHERE chat_id=? AND user_id=?",
+                               (chat_id, int(p))).fetchone()
+            if row:
+                return SimpleNamespace(id=row["user_id"], username=row["username"],
+                                       full_name=row["name"] or str(row["user_id"]))
+    return None
+
+
+def target_specified(parts):
+    """Указал ли пользователь @юзернейм или ID (даже если не нашёлся)."""
+    return any(p.startswith("@") or p.isdigit() for p in parts[1:])
+
+
+async def read_target(update, context, parts):
+    """Кого показывать в ЧИТАЮЩИХ командах (лп, профиль).
+    По умолчанию — сам отправитель. По @юзеру/ID — указанного (любой может посмотреть).
+    По НАСТОЯЩЕМУ ответу — только если отправитель модератор+ (чтобы участники не путались)."""
+    sender = update.effective_user
+    if target_specified(parts):
+        return resolve_target(update, parts) or False     # False = указан, но не найден
+    if real_reply(update.message):
+        if await eff_role(update, context) >= MODER:
+            return real_reply(update.message).from_user
+    return sender
+
+
+async def eff_role(update, context, user_id=None):
+    chat_id = update.effective_chat.id
+    uid = user_id or update.effective_user.id
+    db_role = get_role(chat_id, uid)
+    try:
+        m = await context.bot.get_chat_member(chat_id, uid)
+        # Владелец/админ чата получают максимум ADMIN. Роль ЛИДЕР выдаётся
+        # только явно (по ID в SEED_ROLES_BY_ID), чтобы владелец чата
+        # не становился автоматически лидером клана.
+        tg = ADMIN if m.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR) else MEMBER
+    except Exception:
+        tg = MEMBER
+    return max(db_role, tg)
+
+
+async def require(update, context, level):
+    if await eff_role(update, context) < level:
+        await update.message.reply_text("⛔ У тебя недостаточно прав для этого.")
+        return False
+    return True
+
+
+def parse_duration(s):
+    m = re.fullmatch(r"(\d+)\s*([мmчhдd]?)", s.strip().lower())
+    if not m:
+        return None
+    val, unit = int(m.group(1)), m.group(2)
+    if unit in ("ч", "h"):
+        return val * 60
+    if unit in ("д", "d"):
+        return val * 60 * 24
+    return val
+
+
+def fmt_duration(minutes):
+    """Красивый вывод длительности: 30 мин · 12 ч · 7 дн (без дробей, где не нужно)."""
+    minutes = int(minutes)
+    if minutes % (60 * 24) == 0 and minutes >= 60 * 24:
+        return f"{minutes // (60 * 24)} дн"
+    if minutes % 60 == 0 and minutes >= 60:
+        return f"{minutes // 60} ч"
+    if minutes >= 60:
+        return f"{round(minutes / 60, 1)} ч"
+    return f"{minutes} мин"
+
+
+FULL_PERMS = ChatPermissions(
+    can_send_messages=True, can_send_polls=True, can_send_other_messages=True,
+    can_add_web_page_previews=True, can_send_audios=True, can_send_documents=True,
+    can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
+    can_send_voice_notes=True)
+
+
+async def do_mute(context, chat_id, user_id, minutes):
+    until = msk_now() + timedelta(minutes=minutes)
+    await context.bot.restrict_chat_member(
+        chat_id, user_id, permissions=ChatPermissions(can_send_messages=False), until_date=until)
+    inc_mutes(chat_id, user_id)
+
+
+async def do_exclude(context, chat_id, user_id):
+    await context.bot.ban_chat_member(chat_id, user_id)
+    await context.bot.unban_chat_member(chat_id, user_id)
+
+
+# --- Анти-рейд ---
+_recent_joins = {}   # chat_id -> [timestamps]
+_raid_until = {}     # chat_id -> unix-время до конца локдауна
+
+
+async def check_raid(context, chat_id, member):
+    """Фиксирует вход; при наплыве включает защиту. Возвращает True, если действует локдаун
+    (входящего стоит ограничить и не приветствовать как обычно)."""
+    now = time.time()
+    js = [t for t in _recent_joins.get(chat_id, []) if now - t < RAID_WINDOW]
+    js.append(now)
+    _recent_joins[chat_id] = js
+    locked = now < _raid_until.get(chat_id, 0)
+    if not locked and len(js) >= RAID_JOIN_COUNT:
+        _raid_until[chat_id] = now + RAID_LOCKDOWN_MIN * 60
+        locked = True
+        try:
+            await context.bot.send_message(
+                chat_id,
+                f"{pe('shield')} <b>Анти-рейд: наплыв входов</b> ({len(js)} за минуту).\n"
+                f"Новые участники на {RAID_LOCKDOWN_MIN} мин в режиме «только чтение» до проверки админом. "
+                f"Снять ограничение: <code>unmute</code> ответом на сообщение участника.",
+                parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        for admin_id in ({LEADER_ID} | CONTEST_CREATORS):
+            try:
+                await context.bot.send_message(
+                    admin_id, f"{pe('warn')} Возможный рейд: {len(js)} входов за минуту. "
+                    f"Защита включена на {RAID_LOCKDOWN_MIN} мин — новые ограничены.", parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+    if locked:
+        try:
+            await context.bot.restrict_chat_member(chat_id, member.id, permissions=ChatPermissions(can_send_messages=False))
+        except Exception:
+            pass
+    return locked
+
+
+async def check_tag_gate(update, context, user):
+    """Тег-гейт для новичков: нет тега → каждый день тег-варн; 3 дня без тега → исключение."""
+    chat_id = update.effective_chat.id
+    if user.id == LEADER_ID or user.id in CONTEST_CREATORS or user.id in EXCLUDED_IDS:
+        return
+    row = get_user(chat_id, user.id)
+    if not row or not row["tag_gate"]:
+        return                                           # не новичок (старичков гейт не трогает)
+    if row["brawl_tag"]:
+        # тег есть — снимаем тег-варны, если оставались
+        if row["tag_warns"]:
+            conn.execute("UPDATE users SET tag_warns=0, tag_warn_last=NULL WHERE chat_id=? AND user_id=?", (chat_id, user.id))
+            conn.commit()
+        return
+    today = today_str()
+    if row["tag_warn_last"] == today:
+        return                                           # сегодня уже предупреждали
+    n = (row["tag_warns"] or 0) + 1
+    conn.execute("UPDATE users SET tag_warns=?, tag_warn_last=? WHERE chat_id=? AND user_id=?", (n, today, chat_id, user.id))
+    conn.commit()
+    if n >= 3:
+        try:
+            await do_exclude(context, chat_id, user.id)
+        except Exception:
+            pass
+        conn.execute("UPDATE users SET tag_warns=0, tag_warn_last=NULL, tag_gate=0 WHERE chat_id=? AND user_id=?", (chat_id, user.id))
+        conn.commit()
+        try:
+            await update.message.reply_text(
+                f"{pe('ban')} <b>{esc(user.full_name)}</b> исключён: не привязал игровой тег за 3 дня (обязательное правило).",
+                parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+    else:
+        try:
+            await update.message.reply_text(
+                f"{pe('warn')} {mention(user)}, привяжи игровой тег: <code>.tag #ТВОЙ_ТЕГ</code>. "
+                f"Это обязательно. Тег-варн <b>{n}/3</b> — на 3-й день без тега будет авто-исключение.",
+                parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+
+
+def fmt_date(iso):
+    try:
+        return datetime.fromisoformat(iso).strftime("%d.%m.%Y")
+    except Exception:
+        return "—"
+
+
+# ============================================================
+#                   ДЕЙСТВИЯ МОДЕРАЦИИ
+# ============================================================
+def log_action(update, target, action, reason=""):
+    """Записывает действие модерации в журнал (modlog)."""
+    try:
+        admin = update.effective_user
+        conn.execute(
+            "INSERT INTO modlog (chat_id, admin_id, admin_name, target_id, target_name, action, reason, ts) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (update.effective_chat.id, admin.id, getattr(admin, "full_name", ""),
+             getattr(target, "id", None), getattr(target, "full_name", ""), action, reason or "", msk_now().isoformat()))
+        conn.commit()
+    except Exception:
+        pass
+
+
+async def act_warn(update, context, t, reason):
+    chat_id = update.effective_chat.id
+    ensure_user(chat_id, t)
+    log_action(update, t, "варн", reason)
+    n = add_warn(chat_id, t.id)
+    bal = add_lp(chat_id, t.id, -WARN_LP_PENALTY)
+    pen = f"\n{pe('lp')} Списано {WARN_LP_PENALTY} LP (баланс: {fmt_lp(bal)})"
+    if n >= MAX_WARNS:
+        clear_warns(chat_id, t.id)
+        await do_exclude(context, chat_id, t.id)
+        await update.message.reply_text(
+            f"{pe('ban')} <b>{esc(t.full_name)}</b> получил 3-й варн и исключён (кодекс 4.3).\nПричина: {esc(reason)}{pen}",
+            parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text(
+            f"{pe('warn')} <b>{esc(t.full_name)}</b> — варн {n}/{MAX_WARNS}.\nПричина: {esc(reason)}{pen}\n"
+            f"Снимется через {WARN_LIFETIME_DAYS} дней.", parse_mode=ParseMode.HTML)
+
+
+async def act_unwarn(update, context, t, reason=""):
+    chat_id = update.effective_chat.id
+    ensure_user(chat_id, t)
+    log_action(update, t, "снят варн", reason)
+    before = count_warns(chat_id, t.id)
+    n = remove_one_warn(chat_id, t.id)
+    extra = f"\nПричина: {esc(reason)}" if reason else ""
+    if before > 0:
+        # варн реально сняли — возвращаем списанные за него LP
+        bal = add_lp(chat_id, t.id, WARN_LP_PENALTY)
+        ref = f"\n{pe('lp')} Возвращено {WARN_LP_PENALTY} LP (баланс: {fmt_lp(bal)})"
+        await update.message.reply_text(
+            f"{pe('check')} Снят варн у <b>{esc(t.full_name)}</b>. Осталось: {n}/{MAX_WARNS}.{ref}{extra}",
+            parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text(
+            f"{pe('catneutral')} У <b>{esc(t.full_name)}</b> нет активных варнов.", parse_mode=ParseMode.HTML)
+
+
+async def act_mute(update, context, t, minutes, reason):
+    log_action(update, t, f"мут {fmt_duration(minutes)}", reason)
+    await do_mute(context, update.effective_chat.id, t.id, minutes)
+    await update.message.reply_text(
+        f"{pe('mute')} <b>{esc(t.full_name)}</b> получил мут на {fmt_duration(minutes)}.\nПричина: {esc(reason)}", parse_mode=ParseMode.HTML)
+
+
+async def act_unmute(update, context, t, reason=""):
+    log_action(update, t, "снят мут", reason)
+    await context.bot.restrict_chat_member(update.effective_chat.id, t.id, permissions=FULL_PERMS)
+    extra = f"\nПричина: {esc(reason)}" if reason else ""
+    await update.message.reply_text(f"{pe('unmute')} С <b>{esc(t.full_name)}</b> снят мут.{extra}", parse_mode=ParseMode.HTML)
+
+
+async def act_ban(update, context, t, reason):
+    log_action(update, t, "бан", reason)
+    await context.bot.ban_chat_member(update.effective_chat.id, t.id)
+    await update.message.reply_text(
+        f"{pe('ban')} <b>{esc(t.full_name)}</b> забанен.\nПричина: {esc(reason)}", parse_mode=ParseMode.HTML)
+
+
+async def act_unban(update, context, t, reason=""):
+    log_action(update, t, "разбан", reason)
+    await context.bot.unban_chat_member(update.effective_chat.id, t.id)
+    extra = f"\nПричина: {esc(reason)}" if reason else ""
+    await update.message.reply_text(f"{pe('unban')} <b>{esc(t.full_name)}</b> разбанен.{extra}", parse_mode=ParseMode.HTML)
+
+
+async def act_kick(update, context, t):
+    log_action(update, t, "кик", "")
+    await do_exclude(context, update.effective_chat.id, t.id)
+    await update.message.reply_text(f"{pe('unban')} <b>{esc(t.full_name)}</b> исключён (без бана).", parse_mode=ParseMode.HTML)
+
+
+# ============================================================
+#                   ПРОФИЛЬ / LP / РЕПУТАЦИЯ / ТОП
+# ============================================================
+async def show_profile(update, context, user):
+    chat_id = update.effective_chat.id
+    ensure_user(chat_id, user)
+    row = get_user(chat_id, user.id)
+    warns = count_warns(chat_id, user.id)
+    role = max(row["role"], await eff_role(update, context, user.id))
+    uname = f" (@{esc(row['username'])})" if row["username"] else ""
+    week_line = f"{pe('stats')} За неделю: <b>{stat_week(chat_id, user.id)}</b>"
+    if WEEKLY_MSG_NORM > 0 and today_str() >= NORMS_START_DATE:
+        wk = stat_week(chat_id, user.id)
+        week_line += f" / норма {WEEKLY_MSG_NORM} {pe('check') if wk >= WEEKLY_MSG_NORM else pe('cross')}"
+    text = (
+        f"{pe('person')} <b>ПРОФИЛЬ {CLAN_NAME}</b>\n{CLAN_LINE}\n"
+        f"{esc(user.full_name)}{uname}\n\n"
+        f"<blockquote>{pe('role')} Роль: <b>{ROLE_NAMES.get(role,'Участник')}</b>\n"
+        f"{pe('lp')} LP: <b>{fmt_lp(row['lp'])}</b> / {LP_MAX}\n"
+        f"{pe('star')} Репутация: <b>{row['reputation']}</b></blockquote>\n"
+        f"<blockquote>{pe('msg')} Всего сообщений: <b>{stat_total(chat_id, user.id)}</b>\n"
+        f"{pe('calendar')} Сегодня: <b>{stat_today(chat_id, user.id)}</b>\n"
+        f"{week_line}</blockquote>\n"
+        f"{pe('fire')} Серия: <b>{row['streak'] or 0} {_days_word(row['streak'] or 0)} подряд</b>"
+        f" · рекорд <b>{(row['streak_best'] if 'streak_best' in row.keys() else 0) or 0}</b>"
+    )
+    # тег Brawl Stars (если привязан)
+    text += brawl_profile_line(chat_id, user.id)
+    # прогресс до награды — всем, кто в экономике (кроме «замороженных» админов)
+    if user.id not in EXCLUDED_IDS:
+        text += f"\n\n<blockquote>{progress_line(row['lp'])}</blockquote>"
+    # дисциплина (варны, муты, стадия) — видно ТОЛЬКО модераторам и выше
+    if await eff_role(update, context) >= MODER:
+        stages = {0: "чисто", 1: "был устный выговор", 2: "был мут"}
+        nw = count_norm_warns(chat_id, user.id)
+        vac = (f" · в отпуске до {row['vacation_until']}"
+               if (row["vacation_until"] and row["vacation_until"] >= today_str()) else "")
+        text += (f"\n\n{pe('shield')} <i>Для модерации:</i>\n"
+                 f"<blockquote>{pe('warn')} Варны: <b>{warns}/{MAX_WARNS}</b>\n"
+                 f"{pe('cup')} Норм-варны: <b>{nw}/{NORM_WARN_LIMIT}</b>{vac}\n"
+                 f"{pe('mute')} Получено мутов: <b>{row['mutes']}</b>\n"
+                 f"{pe('stats')} Стадия: <b>{stages.get(row['disc_stage'], 'чисто')}</b></blockquote>")
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def give_rep(update, context, t, delta=1):
+    chat_id = update.effective_chat.id
+    giver = update.effective_user
+    if t.id == giver.id:
+        return await update.message.reply_text("Нельзя менять репутацию самому себе 🙂")
+    grow = get_user(chat_id, giver.id)
+    if grow and grow["last_rep"]:
+        try:
+            last = datetime.fromisoformat(grow["last_rep"])
+            if msk_now() - last < timedelta(minutes=REP_COOLDOWN_MIN):
+                left = REP_COOLDOWN_MIN - int((msk_now()-last).total_seconds()//60)
+                return await update.message.reply_text(
+                    f"{pe('clock')} Репутацию можно менять раз в {REP_COOLDOWN_MIN} мин. Подожди ещё {left} мин.",
+                    parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+    ensure_user(chat_id, t)
+    conn.execute("UPDATE users SET reputation=reputation+? WHERE chat_id=? AND user_id=?", (delta, chat_id, t.id))
+    conn.execute("UPDATE users SET last_rep=? WHERE chat_id=? AND user_id=?", (msk_now().isoformat(), chat_id, giver.id))
+    conn.commit()
+    row = get_user(chat_id, t.id)
+    newrep = row["reputation"] if row else 0
+    if delta >= 0:
+        await update.message.reply_text(
+            f"{pe('star')} <b>{esc(t.full_name)}</b> получает +1 к репутации! Сейчас: <b>{newrep}</b>",
+            parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text(
+            f"{pe('warn')} <b>{esc(t.full_name)}</b> теряет 1 репутацию. Сейчас: <b>{newrep}</b>",
+            parse_mode=ParseMode.HTML)
+
+
+async def show_top(update, context, args):
+    """args — список слов после 'топ'. Категория: актив/очки/реп. Период: день/неделя/(пусто=всё)."""
+    chat_id = update.effective_chat.id
+    words = [w.lower() for w in args]
+    # период
+    if any(w in ("день", "сегодня", "day", "today") for w in words):
+        period = "day"
+    elif any(w in ("неделя", "нед", "week") for w in words):
+        period = "week"
+    else:
+        period = "all"
+    # категория
+    if any(w in ("очки", "лп", "lp", "points") for w in words):
+        cat = "lp"
+    elif any(w in ("реп", "репутация", "rep") for w in words):
+        cat = "rep"
+    elif any(w in ("trophies", "trophy", "кубки", "cups", "cup") for w in words):
+        cat = "trophies"
+    else:
+        cat = "msg"     # «актив» и значение по умолчанию
+
+    medals = {0: pe("gold"), 1: pe("silver"), 2: pe("bronze")}
+    unit = ""
+
+    if cat == "rep":
+        rows = conn.execute("SELECT name, reputation AS val FROM users WHERE chat_id=? ORDER BY val DESC LIMIT 10", (chat_id,)).fetchall()
+        label = "по репутации"
+    elif cat == "trophies":
+        rows = conn.execute(
+            "SELECT COALESCE(brawl_name, name) AS name, brawl_trophies AS val FROM users "
+            "WHERE chat_id=? AND brawl_tag IS NOT NULL AND brawl_trophies IS NOT NULL "
+            "ORDER BY val DESC LIMIT 10", (chat_id,)).fetchall()
+        label = "по кубкам Brawl Stars"
+    elif cat == "lp":
+        if period == "all":
+            # за всё время топ очков не ведём (есть максимальные балансы) — показываем текущий баланс
+            rows = conn.execute("SELECT name, lp AS val FROM users WHERE chat_id=? ORDER BY val DESC LIMIT 10", (chat_id,)).fetchall()
+            label = "по балансу LP (сейчас)"
+            unit = " LP"
+        else:
+            day_filter = "day=?" if period == "day" else "day BETWEEN ? AND ?"
+            params = (today_str(),) if period == "day" else week_bounds()
+            rows = conn.execute(
+                f"SELECT u.name, COALESCE(SUM(l.delta),0) AS val FROM users u "
+                f"LEFT JOIN lp_log l ON l.chat_id=u.chat_id AND l.user_id=u.user_id AND l.{day_filter} "
+                f"WHERE u.chat_id=? GROUP BY u.user_id ORDER BY val DESC LIMIT 10",
+                (*params, chat_id)).fetchall()
+            label = "по заработанным LP за " + ("сегодня" if period == "day" else "неделю")
+            unit = " LP"
+    else:   # сообщения / актив
+        if period == "day":
+            rows = conn.execute("SELECT u.name, s.cnt AS val FROM stats s JOIN users u USING(chat_id,user_id) "
+                                "WHERE s.chat_id=? AND s.day=? ORDER BY val DESC LIMIT 10", (chat_id, today_str())).fetchall()
+            label = "по активности за сегодня"
+        elif period == "week":
+            mon, sun = week_bounds()
+            rows = conn.execute("SELECT u.name, COALESCE(SUM(s.cnt),0) AS val FROM users u "
+                                "LEFT JOIN stats s ON s.chat_id=u.chat_id AND s.user_id=u.user_id AND s.day BETWEEN ? AND ? "
+                                "WHERE u.chat_id=? GROUP BY u.user_id ORDER BY val DESC LIMIT 10", (mon, sun, chat_id)).fetchall()
+            label = "по активности за неделю (Пн–Вс, МСК)"
+        else:
+            rows = conn.execute("SELECT u.name, COALESCE(SUM(s.cnt),0) AS val FROM users u "
+                                "LEFT JOIN stats s ON s.chat_id=u.chat_id AND s.user_id=u.user_id "
+                                "WHERE u.chat_id=? GROUP BY u.user_id ORDER BY val DESC LIMIT 10", (chat_id,)).fetchall()
+            label = "по активности за всё время"
+
+    rows = [r for r in rows if r["val"]]
+    if not rows:
+        if cat == "trophies":
+            return await update.message.reply_text(
+                f"{pe('game')} Пока ни у кого не привязан тег или нет данных по кубкам. Привяжите тег: <code>.tag #ТЕГ</code>.",
+                parse_mode=ParseMode.HTML)
+        return await update.message.reply_text("Пока нет данных для этого топа.")
+    lines = [f"{pe('cup')} <b>ТОП {CLAN_NAME} — {label}</b>\n"]
+    for i, r in enumerate(rows):
+        if cat == "lp":
+            val = fmt_lp(r["val"])
+        elif cat == "trophies":
+            val = fmt_num(r["val"])
+        else:
+            val = int(r["val"])
+        marker = medals.get(i) or f"{pe('star')}"
+        lines.append(f"<b>{i+1}.</b> {marker} {esc(r['name'])} — <b>{val}</b>{unit}")
+    if cat == "trophies":
+        lines.append(f"\n<i>Кубки обновляются, когда игрок пишет</i> <code>tag</code>.")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def show_season(update, context):
+    chat_id = update.effective_chat.id
+    season = current_season()
+    rows = [r for r in season_top(chat_id, season, 10) if r["val"] > 0]
+    left = season_days_left()
+    head = (f"{pe('cup')} <b>СЕЗОН «{season_title(season)}» — {CLAN_NAME}</b>\n{CLAN_LINE}\n"
+            f"{pe('clock')} До конца сезона: <b>{left} {_days_word(left)}</b>\n\n")
+    if not rows:
+        return await update.message.reply_text(
+            head + "Пока никто не активничал в этом сезоне — будь первым!", parse_mode=ParseMode.HTML)
+    medals = {0: pe("gold"), 1: pe("silver"), 2: pe("bronze")}
+    lines = [f"{pe('growth')} <b>Топ активных в сезоне:</b>"]
+    for i, r in enumerate(rows):
+        marker = medals.get(i) or pe("star")
+        lines.append(f"<b>{i+1}.</b> {marker} {esc(r['name'])} — <b>{r['val']}</b>")
+    tail = (f"\n{pe('crown')} В конце сезона топ-3 получат LP "
+            f"(+{SEASON_REWARDS[1]} / +{SEASON_REWARDS[2]} / +{SEASON_REWARDS[3]}) и попадут в зал славы (<code>hof</code>).")
+    await update.message.reply_text(head + "\n".join(lines) + tail, parse_mode=ParseMode.HTML)
+
+
+def _hof_leaders(chat_id, kind, limit=3):
+    """Топ-N участников по категории для Зала Славы."""
+    if kind == "lp":
+        return conn.execute("SELECT name, lp AS val FROM users WHERE chat_id=? ORDER BY val DESC LIMIT ?",
+                            (chat_id, limit)).fetchall()
+    if kind == "rep":
+        return conn.execute("SELECT name, reputation AS val FROM users WHERE chat_id=? ORDER BY val DESC LIMIT ?",
+                            (chat_id, limit)).fetchall()
+    if kind == "trophies":
+        return conn.execute(
+            "SELECT COALESCE(brawl_name, name) AS name, brawl_trophies AS val FROM users "
+            "WHERE chat_id=? AND brawl_tag IS NOT NULL AND brawl_trophies IS NOT NULL "
+            "ORDER BY val DESC LIMIT ?", (chat_id, limit)).fetchall()
+    return conn.execute(
+        "SELECT u.name, COALESCE(SUM(s.cnt),0) AS val FROM users u "
+        "LEFT JOIN stats s ON s.chat_id=u.chat_id AND s.user_id=u.user_id "
+        "WHERE u.chat_id=? GROUP BY u.user_id ORDER BY val DESC LIMIT ?", (chat_id, limit)).fetchall()
+
+
+async def show_hall_of_fame(update, context):
+    chat_id = update.effective_chat.id
+    medals = {0: pe("gold"), 1: pe("silver"), 2: pe("bronze")}
+
+    def fmt_top(kind, unit="", is_lp=False, is_tr=False):
+        rows = [r for r in _hof_leaders(chat_id, kind, 3) if r["val"]]
+        if not rows:
+            return None
+        parts = []
+        for i, r in enumerate(rows):
+            v = fmt_lp(r["val"]) if is_lp else (fmt_num(r["val"]) if is_tr else int(r["val"]))
+            parts.append(f"{medals.get(i, pe('star'))} {esc(r['name'])} — <b>{v}</b>{unit}")
+        return "\n".join(parts)
+
+    sections = []
+    for kind, title, kw in (("lp", "По LP", dict(unit=" LP", is_lp=True)),
+                            ("msg", "По сообщениям", {}),
+                            ("rep", "По репутации", {}),
+                            ("trophies", "По кубкам Brawl Stars", dict(is_tr=True))):
+        t = fmt_top(kind, **kw)
+        if t:
+            icon = {"lp": pe("lp"), "msg": pe("msg"), "rep": pe("star"), "trophies": pe("cup")}[kind]
+            sections.append(f"{icon} <b>{title}</b>\n{t}")
+
+    # победители сезонов (если есть)
+    rows = conn.execute(
+        "SELECT season, rank, name, score FROM hall_of_fame WHERE chat_id=? ORDER BY season DESC, rank ASC",
+        (chat_id,)).fetchall()
+    season_block = ""
+    if rows:
+        seasons = {}
+        for r in rows:
+            seasons.setdefault(r["season"], []).append(r)
+        blocks = []
+        for season, items in list(seasons.items())[:6]:
+            winners = " · ".join(f"{medals.get(it['rank'] - 1, '')} {esc(it['name'])}"
+                                 for it in sorted(items, key=lambda x: x["rank"]))
+            blocks.append(f"<b>{season_title(season)}</b>\n{winners}")
+        season_block = f"\n\n{pe('calendar')} <b>Победители сезонов</b>\n" + "\n\n".join(blocks)
+
+    if not sections and not season_block:
+        return await update.message.reply_text(
+            f"{pe('cup')} Зал славы пока пуст — статистика появится, когда участники начнут писать.",
+            parse_mode=ParseMode.HTML)
+    body = "\n\n".join(sections) + season_block
+    await update.message.reply_text(
+        f"{pe('cup')} <b>ЗАЛ СЛАВЫ — {CLAN_NAME}</b>\n{CLAN_LINE}\n\n{body}", parse_mode=ParseMode.HTML)
+
+
+# ===================== КНОПОЧНОЕ МЕНЮ И МАГАЗИН =====================
+def main_menu_keyboard(owner_id):
+    """Главное меню (инлайн-кнопки). owner_id — кто открыл меню (жать может только он).
+    В подписях кнопок только обычные эмодзи (премиум там не работают)."""
+    u = owner_id
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👤 Профиль", callback_data=f"menu:profile:{u}"),
+         InlineKeyboardButton("🛒 Магазин", callback_data=f"menu:shop:{u}")],
+        [InlineKeyboardButton("🏆 Топы", callback_data=f"menu:top:{u}"),
+         InlineKeyboardButton("📅 Сезон", callback_data=f"menu:season:{u}")],
+        [InlineKeyboardButton("🔥 Стрик", callback_data=f"menu:streak:{u}"),
+         InlineKeyboardButton("👑 Зал славы", callback_data=f"menu:hof:{u}")],
+        [InlineKeyboardButton("📋 Нормы", callback_data=f"menu:norms:{u}"),
+         InlineKeyboardButton("📜 Правила", callback_data=f"menu:rules:{u}")],
+        [InlineKeyboardButton("❓ Помощь", callback_data=f"help:menu:{u}")],
+    ])
+
+
+def store_keyboard():
+    """Кнопки покупки товаров за LP."""
+    rows = []
+    for key, name, price, _e in STORE_ITEMS:
+        rows.append([InlineKeyboardButton(f"{name} — {price} LP", callback_data=f"buy:{key}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _proxy_update(update):
+    """Обёртка для колбэков: даёт .message (сообщение под кнопкой), .effective_chat/.effective_user."""
+    cq = update.callback_query
+    return SimpleNamespace(message=cq.message, effective_chat=cq.message.chat,
+                           effective_user=cq.from_user, callback_query=cq)
+
+
+async def menu_cmd(update, context):
+    kb = main_menu_keyboard(update.effective_user.id)
+    try:
+        await update.message.reply_text(
+            f"{pe('crown')} <b>МЕНЮ {CLAN_NAME}</b>\n{CLAN_LINE}\n"
+            f"<i>Выбери раздел кнопкой ниже.</i>", parse_mode=ParseMode.HTML,
+            reply_markup=kb)
+    except Exception as e:
+        print(f"[MENU] ошибка отправки меню (HTML): {e}", flush=True)
+        try:
+            await update.message.reply_text(f"МЕНЮ {CLAN_NAME}\nВыбери раздел кнопкой ниже.", reply_markup=kb)
+        except Exception as e2:
+            print(f"[MENU] ошибка отправки меню (plain): {e2}", flush=True)
+
+
+async def store_info(update, context):
+    hour = msk_now().hour
+    if not (STORE_OPEN_HOUR <= hour < STORE_CLOSE_HOUR):
+        return await update.message.reply_text(
+            f"{pe('lock')} <b>{CLAN_NAME} STORE — закрыт</b>\n{CLAN_LINE}\n"
+            f"Магазин работает ежедневно с <b>{STORE_OPEN_HOUR}:00</b> до <b>{STORE_CLOSE_HOUR}:00</b> по МСК.\n"
+            f"Загляни в рабочее время {pe('catneutral')}", parse_mode=ParseMode.HTML)
+    await update.message.reply_text(
+        f"{pe('shop')} <b>{CLAN_NAME} STORE</b>\n{CLAN_LINE}\n"
+        f"<i>Внутренний магазин клана. Чем активнее ты — тем больше преимуществ.</i>\n\n"
+        f"{pe('lp')} <b>Что такое LP</b>\n"
+        f"<blockquote>LP (Linkor Points) — внутренняя валюта клана. Их нельзя купить, "
+        f"передать или вывести — только заработать активностью. Баланс до {LP_MAX} LP.</blockquote>\n"
+        f"{pe('growth')} <b>Как получать LP</b>\n"
+        f"<blockquote>{pe('msg')} За каждое сообщение в чате — будь активным каждый день, и LP копятся\n"
+        f"{pe('fire')} Чем выше твоя дневная активность, тем больше LP (есть честный дневной потолок от спама)\n"
+        f"{pe('cup')} Норма кубков — +{NORM_TROPHY_LP} LP · {pe('star')} Норма ранга (Легендарный) — +{NORM_RANK_LP} LP\n"
+        f"{pe('hug')} Помощь, медийность, сложные задачи — на усмотрение администрации</blockquote>\n"
+        f"{pe('pin')} <b>Товары за LP</b>\n"
+        f"<blockquote>{pe('bp')} Brawl Pass — 850 LP\n"
+        f"{pe('bpup')} Улучшение Brawl Pass до BP Plus — 750 LP\n"
+        f"{pe('bpplus')} Brawl Pass Plus — 1650 LP\n"
+        f"{pe('pro')} Pro Pass — 2800 LP\n"
+        f"{pe('rate')} Курс: 1 LP = 0.5 ₽ скидки при покупке за рубли</blockquote>\n"
+        f"<i>Улучшение покупается только если у тебя уже есть Brawl Pass.</i>\n"
+        f"{pe('crown')} <b>За рубли</b>\n"
+        f"<blockquote>Паки и гемы — цены по курсу, уточняй у менеджера {STORE_MANAGER}.\n"
+        f"Покупка и получение товара — тоже через менеджера.</blockquote>\n"
+        f"{pe('scales')} <b>Правила STORE</b>\n"
+        f"<blockquote>Накрутка и передача LP запрещены, фейковые оплаты — блокировка. "
+        f"При ошибке начисления по вине STORE — компенсируем.</blockquote>\n"
+        f"{pe('clock')} Работаем ежедневно {STORE_OPEN_HOUR}:00–{STORE_CLOSE_HOUR}:00 МСК.\n"
+        f"{pe('lp')} <i>Нажми на товар ниже — оформим заявку, LP зарезервируются до выдачи.</i>",
+        parse_mode=ParseMode.HTML, reply_markup=store_keyboard())
+
+
+async def norms_info(update, context):
+    await update.message.reply_text(
+        f"{pe('excl')} <b>ОБЯЗАТЕЛЬНЫЕ НОРМЫ КЛАНА {CLAN_NAME}</b>\n{CLAN_LINE}\n"
+        f"<i>Регламент действует для каждого участника без исключений.</i>\n\n"
+        f"<blockquote>{pe('star')} Прирост кубков: минимум +{WEEKLY_TROPHY_NORM} в неделю\n"
+        f"{pe('msg')} Активность: минимум {WEEKLY_MSG_NORM} сообщений в неделю\n"
+        f"{pe('cup')} Ранг: достичь Легендарного (Legendary) за сезон\n"
+        f"{pe('warn')} Отсутствие более 3 дней без предупреждения — исключение</blockquote>\n"
+        f"{pe('calendar')} <b>Нормы кубков и активности считаются с 22 июня 2026</b> "
+        f"(первые 2 недели — мягкий старт без штрафов).\n"
+        f"{pe('shield')} <b>Наказания за невыполнение</b>\n"
+        f"<blockquote>За каждую невыполненную норму (кубки или активность) — −{NORM_FAIL_PENALTY} LP. "
+        f"Плюс норм-варн (максимум один в неделю): 3 норм-варна за месяц — исключение. "
+        f"Кто едет отдыхать/на учёбе — админ ставит «отпуск», нормы на паузе.</blockquote>\n"
+        f"{pe('fire')} <b>Выполнение норм — не просьба, а обязательное условие нахождения в клане.</b> "
+        f"Не тянешь — освобождаешь место тем, кто готов играть и развиваться.",
+        parse_mode=ParseMode.HTML)
+
+
+async def docs_info(update, context):
+    name = f" «{PATCH_NAME}»" if PATCH_NAME else ""
+    await update.message.reply_text(
+        f"{pe('folder')} <b>ДОКУМЕНТАЦИЯ — {BOT_FULL_NAME}</b>\n{CLAN_LINE}\n\n"
+        f"{pe('robot')} Версия: <b>{BOT_VERSION}</b> ({PATCH_CODE}){name}\n"
+        f"{pe('shield')} Тип: <b>{PATCH_TYPE}</b>\n"
+        f"{pe('calendar')} Релиз: <b>{RELEASE_DATE}</b>\n\n"
+        f"{pe('crown')} <b>Разработка</b>\n"
+        f"<blockquote>Владелец и разработчик бота: {BOT_OWNER}\n"
+        f"Администратор бота / владелец чата: {BOT_ADMIN}</blockquote>\n"
+        f"{pe('scroll')} <b>О боте</b>\n"
+        f"<blockquote>Бот клана {CLAN_NAME}: модерация по кодексу, система LP, статистика "
+        f"активности, конкурсы, магазин и AI-помощник.</blockquote>\n"
+        f"{pe('bulb')} Нашёл баг или есть идея — пиши {BOT_ADMIN}.\n"
+        f"{pe('star')} <b>История изменений</b> — ниже ⤵️",
+        parse_mode=ParseMode.HTML)
+    # История изменений: каждая версия — в раскрывающейся цитате (свёрнута, чтобы не засорять чат).
+    # Разбиваем на сообщения, чтобы не упереться в лимит Telegram (4096 символов).
+    ver_names = {"5": "Цитадель", "4": "Адмирал", "3": "Флагман"}
+    buf = ""
+    for ver, kind, items in CHANGELOG_HISTORY:
+        vn = ver_names.get(ver.split(".")[0], "")
+        vlabel = f"{ver} «{vn}»" if vn else ver
+        body = premiumize("\n".join(items))
+        block = (f"{pe('star')} <b>{vlabel} — {kind}</b>\n"
+                 f"<blockquote expandable>{body}</blockquote>")
+        if buf and len(buf) + len(block) + 2 > 3500:
+            await update.message.reply_text(buf, parse_mode=ParseMode.HTML)
+            buf = ""
+        buf += ("\n\n" if buf else "") + block
+    if buf:
+        await update.message.reply_text(buf, parse_mode=ParseMode.HTML)
+
+
+def _faq_text():
+    """Текст соглашения/FAQ (используется и для показа, и для согласия по кнопке)."""
+    return (
+        f"{pe('scroll')} <b>СОГЛАШЕНИЕ И FAQ — {CLAN_NAME}</b>\n{CLAN_LINE}\n"
+        f"<i>Действует для каждого, кто состоит в клане, пользуется ботом, магазином (STORE) "
+        f"или обращается в поддержку.</i>\n\n"
+
+        f"{pe('check')} <b>1. Принятие соглашения</b>\n"
+        f"<blockquote>Используя бота, STORE или находясь в клане {CLAN_NAME}, ты "
+        f"<b>автоматически и полностью соглашаешься</b> с этим соглашением — даже если не читал его. "
+        f"Не согласен хотя бы с одним пунктом — прекрати пользоваться ботом и покинь клан.</blockquote>\n"
+
+        f"{pe('lp')} <b>2. LP и STORE</b>\n"
+        f"<blockquote>LP — внутренние клановые баллы. Это <b>не деньги</b>: они не имеют реальной "
+        f"стоимости, не покупаются напрямую, не передаются между участниками, не обмениваются на валюту и "
+        f"не подлежат возврату. Награды и товары в STORE, а также <b>призы за конкурсы и ивенты</b> "
+        f"выдаются <b>на усмотрение администрации</b> и не гарантируются — их наличие, сроки и условия "
+        f"могут измениться. Ничто в этом соглашении не является трудовым договором или обещанием выплаты.</blockquote>\n"
+
+        f"{pe('rate')} <b>3. Покупки за рубли</b>\n"
+        f"<blockquote>Любые покупки за деньги оформляются индивидуально через менеджера {STORE_MANAGER}. "
+        f"Все условия (цена, сроки, порядок выдачи, возврат) согласовываются <b>до оплаты</b>. "
+        f"Совершая оплату, ты подтверждаешь согласие с этими условиями. Администрация не несёт "
+        f"ответственности за договорённости, совершённые в обход официального менеджера.</blockquote>\n"
+
+        f"{pe('shield')} <b>4. Решения администрации</b>\n"
+        f"<blockquote>Наказания (предупреждение, мут, бан, исключение) и начисление/списание LP — "
+        f"на усмотрение администрации в рамках кодекса. Решения администрации <b>окончательны</b>. "
+        f"Не согласен с наказанием — есть цивилизованная процедура: написать боту в ЛС «appeal». "
+        f"Оскорбления и давление на администрацию обжалование не ускоряют.</blockquote>\n"
+
+        f"{pe('folder')} <b>5. Данные</b>\n"
+        f"<blockquote>Для работы функций бот хранит: твой ID, @юзернейм, имя, активность, баланс LP, "
+        f"репутацию и привязанный игровой тег. Пользуясь ботом, ты соглашаешься на их обработку. "
+        f"Эти данные используются только внутри клана и не передаются третьим лицам.</blockquote>\n"
+
+        f"{pe('warn')} <b>6. Ответственность</b>\n"
+        f"<blockquote>Бот и клан предоставляются «как есть». Администрация не отвечает за технические "
+        f"сбои, временную недоступность, потерю LP по причинам вне её контроля, а также за действия "
+        f"Supercell, Telegram или третьих лиц. Участие в клане и использование бота — добровольные.</blockquote>\n"
+
+        f"{pe('growth')} <b>7. Изменения</b>\n"
+        f"<blockquote>Правила, нормы, курс LP, ассортимент STORE и условия этого соглашения могут "
+        f"меняться в любой момент без отдельного уведомления. Продолжая пользоваться ботом и оставаясь "
+        f"в клане, ты соглашаешься с актуальной версией.</blockquote>\n"
+
+        f"{pe('person')} <b>8. Несовершеннолетним</b>\n"
+        f"<blockquote>Если тебе нет 18 лет, участвуй только с ведома родителей или опекунов, и любые "
+        f"вопросы, связанные с деньгами, решай вместе с ними. Помни: ничто здесь не является трудовым "
+        f"договором и не гарантирует выплат.</blockquote>\n"
+
+        f"{pe('scales')} <b>9. Споры</b>\n"
+        f"<blockquote>Все спорные ситуации решаются администрацией клана {CLAN_NAME}, и её решение "
+        f"является окончательным.</blockquote>\n"
+
+        f"{pe('catneutral')} Остались вопросы — пиши {BOT_ADMIN}. Удачи в боях!"
+    )
+
+
+async def faq_info(update, context):
+    """Пользовательское соглашение / FAQ (показ в личке)."""
+    await update.message.reply_text(_faq_text(), parse_mode=ParseMode.HTML)
+
+
+def faq_deeplink(context):
+    """Ссылка, открывающая бота в ЛС с запуском соглашения."""
+    uname = getattr(context.bot, "username", None) or "bot"
+    return f"https://t.me/{uname}?start=agree"
+
+
+async def send_faq_agreement(update, context):
+    """Показывает соглашение с кнопками Да/Нет (в личке)."""
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Да, я согласен", callback_data="faq:yes"),
+        InlineKeyboardButton("❌ Нет, не согласен", callback_data="faq:no")]])
+    await update.message.reply_text(
+        _faq_text() + f"\n\n{pe('excl')} <b>Чтобы пользоваться ботом и состоять в клане, прими соглашение кнопкой ниже.</b>",
+        parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+def has_agreed(user_id):
+    if user_id == LEADER_ID or user_id in CONTEST_CREATORS or user_id in EXCLUDED_IDS:
+        return True
+    row = conn.execute("SELECT agreed_faq FROM users WHERE chat_id=? AND user_id=?",
+                       (ALLOWED_CHAT_ID, user_id)).fetchone()
+    return bool(row and row["agreed_faq"])
+
+
+async def summon_all(update, context, text):
+    """Сбор клана: упоминает (пингует) всех известных участников. Только админ."""
+    chat_id = update.effective_chat.id
+    note = text.split(maxsplit=1)[1].strip() if len(text.split()) > 1 else ""
+    rows = conn.execute("SELECT user_id, name FROM users WHERE chat_id=?", (chat_id,)).fetchall()
+    if not rows:
+        return await update.message.reply_text("Пока некого созывать — участники появятся, когда напишут в чат.")
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    header = f"{pe('mega')} <b>СБОР КЛАНА {CLAN_NAME}!</b>"
+    if note:
+        header += f"\n<blockquote>{esc(note)}</blockquote>"
+    mentions = [f'<a href="tg://user?id={r["user_id"]}">{esc(r["name"] or "боец")}</a>' for r in rows]
+    BATCH = 40
+    sent = False
+    for i in range(0, len(mentions), BATCH):
+        chunk = " ".join(mentions[i:i + BATCH])
+        body = (header + "\n\n" + chunk) if not sent else chunk
+        await context.bot.send_message(chat_id, body, parse_mode=ParseMode.HTML)
+        sent = True
+
+
+# ============================================================
+#               КОНКУРСЫ (как @BestRandom_bot)
+# ============================================================
+active_giveaways = {}   # chat_id -> {msg_id, count, desc, parts:{user_id:name}}
+
+
+def _giveaway_text(gw):
+    title = esc(gw.get("name", "КОНКУРС")) or "КОНКУРС"
+    body = esc(gw.get("desc", "")) or "Жми кнопку, чтобы участвовать!"
+    tail = f"\n{pe('clock')} Длительность: {gw['minutes']} мин" if gw.get("minutes") else ""
+    return (f"{pe('contest')} <b>{title}</b>\n\n{body}\n\n"
+            f"{pe('cup')} Победителей: {gw['count']}\n{pe('hug')} Участников: {len(gw['parts'])}{tail}")
+
+
+async def publish_giveaway(context, data):
+    """Публикует конкурс в чат клана и ставит таймер авто-итогов."""
+    chat_id = ALLOWED_CHAT_ID
+    gw = {"name": data["name"], "count": data["count"], "desc": data["desc"],
+          "minutes": data["minutes"], "parts": {}}
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎉 Участвовать", callback_data="gw_join")]])
+    msg = await context.bot.send_message(chat_id, _giveaway_text(gw),
+                                         parse_mode=ParseMode.HTML, reply_markup=kb)
+    gw["id"] = msg.message_id
+    gw["msg_id"] = msg.message_id
+    active_giveaways[chat_id] = gw
+    asyncio.create_task(_schedule_end(context, chat_id, gw["minutes"], gw["id"]))
+
+
+async def _schedule_end(context, chat_id, minutes, gw_id):
+    try:
+        await asyncio.sleep(minutes * 60)
+        gw = active_giveaways.get(chat_id)
+        if gw and gw.get("id") == gw_id:
+            await finalize_giveaway(context, chat_id)
+    except Exception:
+        pass
+
+
+async def giveaway_join(update, context):
+    q = update.callback_query
+    chat_id = q.message.chat.id
+    if ALLOWED_CHAT_ID and chat_id != ALLOWED_CHAT_ID:
+        return await q.answer()
+    gw = active_giveaways.get(chat_id)
+    if not gw or q.data != "gw_join":
+        return await q.answer("Конкурс уже завершён.")
+    u = q.from_user
+    if u.id in EXCLUDED_IDS:
+        return await q.answer("🛡️ Администраторы не участвуют в конкурсах.")
+    if u.id in gw["parts"]:
+        return await q.answer("Ты уже участвуешь ✅")
+    gw["parts"][u.id] = u.full_name
+    await q.answer("✅ Ты в игре! Удачи!")
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎉 Участвовать", callback_data="gw_join")]])
+    try:
+        await context.bot.edit_message_text(_giveaway_text(gw), chat_id=chat_id,
+                                             message_id=gw["msg_id"], parse_mode=ParseMode.HTML,
+                                             reply_markup=kb)
+    except Exception:
+        pass
+
+
+async def on_action_callback(update, context):
+    """Обрабатывает нажатия инлайн-кнопок: меню (menu:), покупка (buy:), решение по заказу (order:)."""
+    cq = update.callback_query
+    data = cq.data or ""
+    user = cq.from_user
+    print(f"[CB] нажатие кнопки: {data} от {user.id}", flush=True)
+
+    # ----- СОГЛАСИЕ С FAQ (кнопки в ЛС) -----
+    if data.startswith("faq:"):
+        choice = data.split(":", 1)[1]
+        ensure_user(ALLOWED_CHAT_ID, user)
+        already = has_agreed(user.id)
+        if choice == "yes":
+            if already:
+                await cq.answer("Ты уже принял соглашение ✅")
+            else:
+                conn.execute("UPDATE users SET agreed_faq=1 WHERE chat_id=? AND user_id=?", (ALLOWED_CHAT_ID, user.id))
+                conn.commit()
+                await cq.answer("Спасибо! Соглашение принято.")
+            try:
+                await cq.edit_message_text(
+                    f"{pe('check')} <b>Соглашение принято.</b> Теперь бот тебе полностью доступен.\n"
+                    f"Не забудь привязать игровой тег: <code>.tag #ТВОЙ_ТЕГ</code>. Удачи в клане {CLAN_NAME}! {pe('fire')}",
+                    parse_mode=ParseMode.HTML)
+            except Exception:
+                try:
+                    await cq.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+        else:  # отказ — объясняем, выбор за участником; кнопки убираем
+            await cq.answer()
+            try:
+                await cq.edit_message_text(
+                    f"{pe('catneutral')} Понятно. Без согласия с соглашением пользоваться ботом и состоять в клане "
+                    f"{CLAN_NAME} нельзя. Решение за тобой: можешь покинуть клан или передумать в любой момент — "
+                    f"просто нажми /start и прими соглашение. Если останешься без согласия, администрация может тебя исключить.",
+                    parse_mode=ParseMode.HTML)
+            except Exception:
+                try:
+                    await cq.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+        return
+
+    # ----- РЕШЕНИЕ ПО ОБЖАЛОВАНИЮ (только владелец/со-создатели) -----
+    if data.startswith("appeal:"):
+        if user.id not in ({LEADER_ID} | CONTEST_CREATORS):
+            return await cq.answer("Только администрация может это делать.", show_alert=True)
+        try:
+            _, action, sid = data.split(":", 2)
+            target_id = int(sid)
+        except ValueError:
+            return await cq.answer()
+        approved = (action == "approve")
+        await cq.answer("Решение принято.")
+        verdict = "ОДОБРЕНО ✅" if approved else "ОТКЛОНЕНО ❌"
+        try:
+            await cq.edit_message_text(
+                (cq.message.text_html if hasattr(cq.message, "text_html") else "") +
+                f"\n\n<b>Решение: {verdict}</b> (by {esc(user.full_name)})", parse_mode=ParseMode.HTML)
+        except Exception:
+            try:
+                await cq.message.reply_text(f"Решение по обжалованию: <b>{verdict}</b>", parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+        try:
+            if approved:
+                await context.bot.send_message(
+                    target_id,
+                    f"{pe('check')} Твоё обжалование <b>одобрено</b>. Администрация снимет наказание/восстановит доступ. Спасибо за терпение!",
+                    parse_mode=ParseMode.HTML)
+            else:
+                await context.bot.send_message(
+                    target_id,
+                    f"{pe('cross')} Твоё обжалование рассмотрено и <b>отклонено</b>. Решение администрации окончательно.",
+                    parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        return
+
+    # ----- МЕНЮ (жать может только открывший; раздел открывается в этом же сообщении) -----
+    if data.startswith("menu:"):
+        parts = data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        owner_id = int(parts[2]) if len(parts) > 2 and parts[2].lstrip("-").isdigit() else user.id
+        if user.id != owner_id:
+            return await cq.answer("Это меню открыл другой игрок. Открой своё — напиши: menu", show_alert=True)
+        await cq.answer()
+        back_btn = InlineKeyboardButton("⬅️ Меню", callback_data=f"menu:back:{owner_id}")
+        if action == "back":
+            try:
+                await cq.edit_message_text(
+                    f"{pe('crown')} <b>МЕНЮ {CLAN_NAME}</b>\n{CLAN_LINE}\n"
+                    f"<i>Выбери раздел кнопкой ниже.</i>", parse_mode=ParseMode.HTML,
+                    reply_markup=main_menu_keyboard(owner_id))
+            except Exception:
+                pass
+            return
+        # Захватываем текст раздела, чтобы показать его прямо в этом сообщении (без новых сообщений в чат)
+        cap = {"text": None, "markup": None}
+        async def _cap(text="", **kw):
+            cap["text"] = text
+            if kw.get("reply_markup") is not None:
+                cap["markup"] = kw["reply_markup"]
+        fake_msg = SimpleNamespace(reply_text=_cap, chat=cq.message.chat,
+                                   message_thread_id=getattr(cq.message, "message_thread_id", None))
+        fake = SimpleNamespace(message=fake_msg, effective_chat=cq.message.chat,
+                               effective_user=user, callback_query=cq)
+        try:
+            if action == "profile":
+                await show_profile(fake, context, user)
+            elif action == "shop":
+                await store_info(fake, context)
+            elif action == "top":
+                await show_top(fake, context, ["active"])
+            elif action == "season":
+                await show_season(fake, context)
+            elif action == "hof":
+                await show_hall_of_fame(fake, context)
+            elif action == "norms":
+                await norms_info(fake, context)
+            elif action == "rules":
+                await rules_cmd(fake, context)
+            elif action == "streak":
+                row = get_user(cq.message.chat.id, user.id)
+                cur = (row["streak"] or 0) if row else 0
+                best = (row["streak_best"] or 0) if row else 0
+                cap["text"] = (f"{pe('fire')} Твоя серия: <b>{cur} {_days_word(cur)} подряд</b>\n"
+                               f"{pe('star')} Рекорд: <b>{best} {_days_word(best)}</b>")
+            elif action == "help":
+                cap["text"] = _help_member_text()
+        except Exception as e:
+            print(f"[MENU] ошибка раздела {action}: {e}", flush=True)
+        if cap["markup"] is not None:
+            try:
+                kb = InlineKeyboardMarkup(list(cap["markup"].inline_keyboard) + [[back_btn]])
+            except Exception:
+                kb = InlineKeyboardMarkup([[back_btn]])
+        else:
+            kb = InlineKeyboardMarkup([[back_btn]])
+        try:
+            await cq.edit_message_text(cap["text"] or "—", parse_mode=ParseMode.HTML, reply_markup=kb)
+        except Exception as e:
+            print(f"[MENU] не удалось показать раздел {action}: {e}", flush=True)
+        return
+
+    # ----- КНОПОЧНАЯ СПРАВКА (help:) -----
+    if data.startswith("help:"):
+        parts = data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        owner_id = int(parts[2]) if len(parts) > 2 and parts[2].lstrip("-").isdigit() else user.id
+        if user.id != owner_id:
+            return await cq.answer("Эту справку открыл другой игрок. Открой свою — напиши: help", show_alert=True)
+        await cq.answer()
+        if action in ("menu", "back"):
+            try:
+                await cq.edit_message_text(_help_intro(), parse_mode=ParseMode.HTML,
+                                           reply_markup=help_menu_keyboard(owner_id))
+            except Exception:
+                pass
+            return
+        back = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=f"help:menu:{owner_id}")]])
+        try:
+            await cq.edit_message_text(_help_section(action), parse_mode=ParseMode.HTML, reply_markup=back)
+        except Exception as e:
+            print(f"[HELP] не удалось показать раздел {action}: {e}", flush=True)
+        return
+
+    # ----- ПОКУПКА (резерв LP + заявка менеджеру) -----
+    if data.startswith("buy:"):
+        item = STORE_ITEMS_BY_KEY.get(data.split(":", 1)[1])
+        if not item:
+            return await cq.answer("Товар не найден.")
+        _k, name, price, _e = item
+        chat_id = cq.message.chat.id
+        if ALLOWED_CHAT_ID and chat_id != ALLOWED_CHAT_ID:
+            return await cq.answer()
+        if user.id in EXCLUDED_IDS:
+            return await cq.answer("🛡️ Администраторы вне экономики не покупают.", show_alert=True)
+        ensure_user(chat_id, user)
+        row = get_user(chat_id, user.id)
+        bal = row["lp"] if row else 0
+        if bal < price:
+            return await cq.answer(f"Недостаточно LP. Нужно ещё {fmt_lp(price - bal)}.", show_alert=True)
+        new_bal = add_lp(chat_id, user.id, -price)            # резерв (вернём при отклонении)
+        cur = conn.execute(
+            "INSERT INTO orders (chat_id, user_id, name, item, price, status, ts) VALUES (?,?,?,?,?, 'pending', ?)",
+            (chat_id, user.id, user.full_name, name, price, msk_now().isoformat()))
+        conn.commit()
+        oid = cur.lastrowid
+        await cq.answer("Заявка отправлена! LP зарезервированы.", show_alert=True)
+        await cq.message.reply_text(
+            f"{pe('shop')} <b>{esc(user.full_name)}</b> оформил заявку: <b>{esc(name)}</b> за <b>{price} LP</b>.\n"
+            f"{pe('lp')} LP зарезервированы (баланс: {fmt_lp(new_bal)}). Менеджер выдаст товар.",
+            parse_mode=ParseMode.HTML)
+        admin_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Выдано", callback_data=f"order:done:{oid}"),
+            InlineKeyboardButton("❌ Отклонить", callback_data=f"order:reject:{oid}")]])
+        uname = f" (@{user.username})" if user.username else ""
+        for admin_id in STORE_ADMINS:
+            try:
+                await context.bot.send_message(
+                    admin_id,
+                    f"{pe('shop')} <b>Новый заказ #{oid}</b>\n"
+                    f"Покупатель: <b>{esc(user.full_name)}</b>{uname} (<code>{user.id}</code>)\n"
+                    f"Товар: <b>{esc(name)}</b> · Цена: <b>{price} LP</b> (зарезервировано)\n"
+                    f"Выдай товар и нажми «Выдано», либо «Отклонить» — тогда LP вернутся.",
+                    parse_mode=ParseMode.HTML, reply_markup=admin_kb)
+            except Exception:
+                pass
+        return
+
+    # ----- РЕШЕНИЕ ПО ЗАКАЗУ (только менеджер/владелец) -----
+    if data.startswith("order:"):
+        if user.id not in STORE_ADMINS:
+            return await cq.answer("Только менеджер магазина может это делать.", show_alert=True)
+        try:
+            _, action, oid = data.split(":", 2)
+            oid = int(oid)
+        except ValueError:
+            return await cq.answer()
+        o = conn.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+        if not o:
+            return await cq.answer("Заказ не найден.")
+        if o["status"] != "pending":
+            return await cq.answer(f"Заказ уже обработан: {o['status']}.")
+        if action == "done":
+            conn.execute("UPDATE orders SET status='done' WHERE id=?", (oid,))
+            conn.commit()
+            await cq.answer("Готово: заказ выдан ✅")
+            try:
+                await cq.edit_message_text(
+                    f"{pe('check')} Заказ #{oid} — <b>{esc(o['item'])}</b> для <b>{esc(o['name'])}</b>: ВЫДАНО ✅",
+                    parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+            try:
+                await context.bot.send_message(
+                    o["user_id"], f"{pe('check')} Твой заказ <b>{esc(o['item'])}</b> выдан! Спасибо, что с нами {pe('hug')}",
+                    parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+        elif action == "reject":
+            conn.execute("UPDATE orders SET status='rejected' WHERE id=?", (oid,))
+            conn.commit()
+            add_lp(o["chat_id"], o["user_id"], o["price"])        # возврат LP
+            await cq.answer("Заказ отклонён, LP возвращены.")
+            try:
+                await cq.edit_message_text(
+                    f"{pe('cross')} Заказ #{oid} — <b>{esc(o['item'])}</b> для <b>{esc(o['name'])}</b>: ОТКЛОНЁН, LP возвращены.",
+                    parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+            try:
+                await context.bot.send_message(
+                    o["user_id"], f"{pe('cross')} Заказ <b>{esc(o['item'])}</b> отклонён. {pe('lp')} {o['price']} LP возвращены.",
+                    parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+        return
+
+
+async def finalize_giveaway(context, chat_id):
+    """Подводит итоги и публикует победителей в чат. Используется таймером и вручную."""
+    gw = active_giveaways.pop(chat_id, None)
+    if not gw:
+        return
+    title = esc(gw.get("name", "КОНКУРС"))
+    parts = gw["parts"]
+    if not parts:
+        return await context.bot.send_message(chat_id, f"{pe('contest')} Конкурс «{title}» завершён — участников не было 😔",
+                                              parse_mode=ParseMode.HTML)
+    winners = random.sample(list(parts.keys()), min(gw["count"], len(parts)))
+    lines = [f"{pe('contest')} <b>ИТОГИ: {title}</b>\n", f"{pe('cup')} Победител" + ("и" if len(winners) > 1 else "ь") + ":"]
+    for w in winners:
+        lines.append(f"• <a href=\"tg://user?id={w}\">{esc(parts[w])}</a>")
+    lines.append(f"\nВсего участников: {len(parts)}")
+    await context.bot.send_message(chat_id, "\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def end_giveaway(update, context):
+    """Ручное завершение конкурса досрочно (для админов, в чате)."""
+    if not await require(update, context, ADMIN):
+        return
+    chat_id = update.effective_chat.id
+    if not active_giveaways.get(chat_id):
+        return await update.message.reply_text("Сейчас нет активного конкурса.")
+    await finalize_giveaway(context, chat_id)
+
+
+# ============================================================
+#               ПРИВАТНОЕ СОЗДАНИЕ КОНКУРСА (в личке)
+# ============================================================
+async def emoji_id_report(context, ids):
+    """Формирует список ID премиум-эмодзи с их базовыми смайликами (для подсказки)."""
+    info = {}
+    try:
+        stickers = await context.bot.get_custom_emoji_stickers(list(ids))
+        info = {s.custom_emoji_id: (s.emoji or "") for s in stickers}
+    except Exception:
+        pass
+    lines = []
+    for i in ids:
+        base = info.get(i, "")
+        lines.append(f"{base + ' ' if base else ''}<code>{i}</code>")
+    return "\n".join(lines)
+
+
+async def is_staff(context, user_id):
+    """Считается ли пользователь админом/модером (для помощи и обжалований в ЛС)."""
+    if user_id in ({LEADER_ID} | EXCLUDED_IDS | CONTEST_CREATORS):
+        return True
+    try:
+        if get_role(ALLOWED_CHAT_ID, user_id) >= MODER:
+            return True
+    except Exception:
+        pass
+    try:
+        admins = await context.bot.get_chat_administrators(ALLOWED_CHAT_ID)
+        return any(a.user.id == user_id for a in admins)
+    except Exception:
+        return False
+
+
+async def can_appeal(context, user_id):
+    """Может ли писать обжалование: он есть/был в чате клана (включая забаненных/в муте)."""
+    if get_user(ALLOWED_CHAT_ID, user_id):
+        return True
+    try:
+        m = await context.bot.get_chat_member(ALLOWED_CHAT_ID, user_id)
+        return getattr(m, "status", "left") != "left"
+    except Exception:
+        return False
+
+
+async def dm_profile(update, context):
+    """Личный кабинет в ЛС: профиль, баланс и прогресс для участника клана."""
+    user = update.effective_user
+    row = get_user(ALLOWED_CHAT_ID, user.id)
+    if not row:
+        return await update.message.reply_text(
+            f"{pe('catneutral')} Пока не вижу твою статистику — напиши хотя бы одно сообщение в чате клана, и она появится здесь.",
+            parse_mode=ParseMode.HTML)
+    uname = f" (@{esc(row['username'])})" if row["username"] else ""
+    text = (
+        f"{pe('person')} <b>ЛИЧНЫЙ КАБИНЕТ {CLAN_NAME}</b>\n{CLAN_LINE}\n"
+        f"{esc(row['name'])}{uname}\n\n"
+        f"<blockquote>{pe('role')} Роль: <b>{ROLE_NAMES.get(row['role'],'Участник')}</b>\n"
+        f"{pe('lp')} LP: <b>{fmt_lp(row['lp'])}</b> / {LP_MAX}\n"
+        f"{pe('star')} Репутация: <b>{row['reputation']}</b></blockquote>\n"
+        f"<blockquote>{pe('msg')} Всего сообщений: <b>{stat_total(ALLOWED_CHAT_ID, user.id)}</b>\n"
+        f"{pe('calendar')} Сегодня: <b>{stat_today(ALLOWED_CHAT_ID, user.id)}</b>\n"
+        f"{pe('stats')} За неделю: <b>{stat_week(ALLOWED_CHAT_ID, user.id)}</b></blockquote>\n"
+        f"{pe('fire')} Серия: <b>{(row['streak'] or 0)} {_days_word(row['streak'] or 0)} подряд</b>\n"
+    )
+    text += brawl_profile_line(ALLOWED_CHAT_ID, user.id)
+    if user.id not in EXCLUDED_IDS:
+        text += f"\n<blockquote>{progress_line(row['lp'])}</blockquote>"
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def submit_appeal(update, context, text):
+    """Пересылает обжалование владельцу (и со-создателям) в ЛС с кнопками решения."""
+    user = update.effective_user
+    uname = f" @{user.username}" if user.username else ""
+    body = (f"📨 <b>НОВОЕ ОБЖАЛОВАНИЕ</b>\n{CLAN_LINE}\n"
+            f"От: <b>{esc(user.full_name)}</b>{esc(uname)}\n"
+            f"ID: <code>{user.id}</code>\n\n"
+            f"<blockquote>{esc(text)}</blockquote>\n"
+            f"<i>Реши кнопкой ниже. Снять наказание в чате (мут/бан) нужно вручную.</i>")
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Одобрить", callback_data=f"appeal:approve:{user.id}"),
+        InlineKeyboardButton("❌ Отклонить", callback_data=f"appeal:reject:{user.id}")]])
+    delivered = False
+    for admin_id in ({LEADER_ID} | CONTEST_CREATORS):
+        try:
+            await context.bot.send_message(admin_id, body, parse_mode=ParseMode.HTML, reply_markup=kb)
+            delivered = True
+        except Exception:
+            pass
+    if delivered:
+        return await update.message.reply_text(
+            "✅ Обжалование отправлено администрации на рассмотрение. С тобой свяжутся. Спасибо!")
+    return await update.message.reply_text(
+        "⚠️ Не удалось доставить обжалование автоматически. Напиши напрямую администратору клана.")
+
+
+async def owner_command(update, context, first, parts):
+    """Управляющие команды владельца — работают ВЕЗДЕ (в чате и в личке), только для владельца.
+    Возвращает True, если команда обработана."""
+    if update.effective_user.id != LEADER_ID:
+        return False
+    if first in ("backup", "бэкап", "бекап"):
+        await send_backup(update, context); return True
+    if first in ("modlog", "log", "журнал"):
+        await show_modlog(update, context, parts); return True
+    if first in ("analytics", "dashboard", "аналитика", "статклан"):
+        await clan_analytics(update, context); return True
+    if first in ("checknorms", "проверканорм"):
+        await update.message.reply_text(f"{pe('clock')} <b>Проверяю нормы за неделю…</b>", parse_mode=ParseMode.HTML)
+        d, f, e = await run_norm_check(context, ALLOWED_CHAT_ID, announce=True)
+        if d == 0 and f == 0 and e == 0:
+            await update.message.reply_text(
+                f"{pe('bulb')} Некого проверять — нет снимков кубков этой недели или Brawl API недоступен.",
+                parse_mode=ParseMode.HTML)
+        return True
+    if first in ("snapshotnorms", "снимокнорм"):
+        await update.message.reply_text(f"{pe('clock')} <b>Делаю снимок кубков на начало недели…</b>", parse_mode=ParseMode.HTML)
+        await run_norm_snapshot(context, ALLOWED_CHAT_ID)
+        await update.message.reply_text(f"{pe('check')} <b>Снимок кубков сделан.</b>", parse_mode=ParseMode.HTML)
+        return True
+    if first in ("bonusall", "lpall", "грантвсем", "всемлп"):
+        try:
+            amount = int(parts[1]) if len(parts) > 1 else 0
+        except ValueError:
+            amount = 0
+        if amount == 0 or abs(amount) > LP_MAX:
+            await update.message.reply_text(
+                f"{pe('lp')} <b>Массовое начисление LP</b>\n{CLAN_LINE}\n"
+                f"<blockquote>Формат:\n<code>bonusall 150</code> — начислить всем\n"
+                f"<code>bonusall -50</code> — списать у всех</blockquote>\n"
+                f"Сумма: от 1 до {LP_MAX}.", parse_mode=ParseMode.HTML)
+            return True
+        rows = conn.execute("SELECT user_id FROM users WHERE chat_id=?", (ALLOWED_CHAT_ID,)).fetchall()
+        n = 0
+        for r in rows:
+            if r["user_id"] in EXCLUDED_IDS or r["user_id"] == LEADER_ID:
+                continue
+            add_lp(ALLOWED_CHAT_ID, r["user_id"], amount)
+            n += 1
+        if amount > 0:
+            try:
+                await context.bot.send_message(
+                    ALLOWED_CHAT_ID,
+                    f"{pe('crown')} <b>ПОДАРОК КЛАНУ!</b>\n{CLAN_LINE}\n\n"
+                    f"<blockquote>{pe('lp')} Каждому участнику начислено <b>+{amount} LP</b></blockquote>\n"
+                    f"Получили: <b>{n}</b> чел. Спасибо, что вы с нами! {pe('fire')}", parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+            await update.message.reply_text(
+                f"{pe('check')} <b>Готово.</b> Начислено <b>+{amount} LP</b> {n} участникам, объявление — в чате.",
+                parse_mode=ParseMode.HTML)
+        else:
+            await update.message.reply_text(
+                f"{pe('check')} <b>Готово.</b> Списано <b>{amount} LP</b> у {n} участников (без объявления в чат).",
+                parse_mode=ParseMode.HTML)
+        return True
+    return False
+
+
+async def private_router(update, context):
+    user = update.effective_user
+    if not user:
+        return
+    text = (update.message.text or "").strip()
+    # В личке точка-префикс необязательна: если человек написал «.profile» — срежем точку и поймём как «profile».
+    if CMD_PREFIX and len(text) > 1 and text.startswith(CMD_PREFIX) and not text.startswith(CMD_PREFIX * 2):
+        text = text[len(CMD_PREFIX):].strip()
+    low = text.lower()
+    is_creator = user.id in CONTEST_CREATORS
+    gw_state = context.user_data.get("gw_state")
+    appeal_state = context.user_data.get("appeal_state")
+
+    # --- Эмодзи-ID (инструмент только для админов/создателей) ---
+    if is_creator and not gw_state and not appeal_state:
+        ents = (update.message.entities or []) + (update.message.caption_entities or [])
+        emoji_ids = [e.custom_emoji_id for e in ents if getattr(e, "custom_emoji_id", None)]
+        if emoji_ids:
+            report = await emoji_id_report(context, emoji_ids)
+            return await update.message.reply_text(
+                f"🆔 Нашёл премиум-эмодзи ({len(emoji_ids)} шт.) — рядом базовый смайлик:\n{report}\n\n"
+                f"Скопируй весь список и пришли мне.", parse_mode=ParseMode.HTML)
+        st = getattr(update.message, "sticker", None)
+        if st is not None:
+            cid = getattr(st, "custom_emoji_id", None)
+            if cid:
+                report = await emoji_id_report(context, [cid])
+                return await update.message.reply_text(
+                    f"🆔 ID этого премиум-эмодзи:\n{report}\n\nПришли мне его.", parse_mode=ParseMode.HTML)
+            return await update.message.reply_text(
+                "Это обычный <b>стикер</b>, а не премиум-эмодзи 🙂 Премиум-эмодзи вставляются прямо в текст "
+                "через значок 😀 у поля ввода.", parse_mode=ParseMode.HTML)
+
+    # --- Отмена любого процесса ---
+    if low in ("cancel", "отмена", "/cancel", "стоп"):
+        context.user_data.pop("gw_state", None)
+        context.user_data.pop("gw_new", None)
+        context.user_data.pop("appeal_state", None)
+        return await update.message.reply_text("❌ Отменено.")
+
+    # --- Приём текста обжалования ---
+    if appeal_state == "await_text":
+        if len(text) < 10:
+            return await update.message.reply_text("Опиши обжалование подробнее (хотя бы пару предложений). Или напиши «отмена».")
+        context.user_data.pop("appeal_state", None)
+        return await submit_appeal(update, context, text)
+
+    # --- Старт обжалования (для участников клана) ---
+    if low in ("appeal",):
+        if not await can_appeal(context, user.id):
+            return await update.message.reply_text("Обжалования принимаются только от участников клана LINKOR.")
+        context.user_data["appeal_state"] = "await_text"
+        return await update.message.reply_text(
+            f"⚖️ <b>Обжалование наказания</b>\n{CLAN_LINE}\n"
+            "Опиши в <b>одном сообщении</b> по форме:\n"
+            "<blockquote>1) Какое наказание (мут / бан / варн)\n"
+            "2) Когда примерно выдали\n"
+            "3) Почему считаешь, что его стоит снять</blockquote>\n"
+            "Напиши всё одним сообщением — я передам администрации. Для отмены — «отмена».",
+            parse_mode=ParseMode.HTML)
+
+    # --- Помощь в ЛС (админам — с админ-командами) ---
+    if low in ("help", "commands", "menu"):
+        staff = await is_staff(context, user.id)
+        return await help_cmd(update, context, include_admin=staff)
+
+    # --- Личный кабинет в ЛС (профиль/баланс/прогресс) ---
+    if low in ("profile", "p", "lp", "balance", "cabinet"):
+        return await dm_profile(update, context)
+
+    # --- FAQ / соглашение (только в ЛС, английский триггер) ---
+    if low in ("faq", "terms"):
+        return await faq_info(update, context)
+
+    # --- Управляющие команды владельца (только в личке) ---
+    _parts = low.split()
+    if _parts and await owner_command(update, context, _parts[0], _parts):
+        return
+
+    # --- Создание конкурса (только создатели) ---
+    if is_creator:
+        if not gw_state:
+            if low in ("конкурс", "новыйконкурс", "/конкурс"):
+                context.user_data["gw_new"] = {}
+                context.user_data["gw_state"] = "name"
+                return await update.message.reply_text(
+                    f"{pe('note')} Создаём конкурс.\n\nШаг 1/4 — введи <b>НАЗВАНИЕ</b> конкурса:\n"
+                    "(в любой момент напиши «отмена»)", parse_mode=ParseMode.HTML)
+            return await update.message.reply_text(
+                "Доступно в личке: пришли <b>премиум-эмодзи</b> — верну ID · <b>конкурс</b> — создать конкурс · "
+                "<b>help</b> — команды.", parse_mode=ParseMode.HTML)
+        data = context.user_data["gw_new"]
+        if gw_state == "name":
+            data["name"] = text
+            context.user_data["gw_state"] = "timer"
+            return await update.message.reply_text(
+                "Шаг 2/4 — на сколько <b>МИНУТ</b> запустить конкурс? (например 60)", parse_mode=ParseMode.HTML)
+        if gw_state == "timer":
+            try:
+                data["minutes"] = max(1, int(text))
+            except ValueError:
+                return await update.message.reply_text("Введи число минут, например 60.")
+            context.user_data["gw_state"] = "winners"
+            return await update.message.reply_text("Шаг 3/4 — сколько <b>ПОБЕДИТЕЛЕЙ</b>?", parse_mode=ParseMode.HTML)
+        if gw_state == "winners":
+            try:
+                data["count"] = max(1, int(text))
+            except ValueError:
+                return await update.message.reply_text("Введи число победителей, например 1.")
+            context.user_data["gw_state"] = "desc"
+            return await update.message.reply_text(
+                "Шаг 4/4 — введи <b>ОПИСАНИЕ / УСЛОВИЯ</b> конкурса:", parse_mode=ParseMode.HTML)
+        if gw_state == "desc":
+            data["desc"] = text
+            context.user_data.pop("gw_state", None)
+            context.user_data.pop("gw_new", None)
+            if not ALLOWED_CHAT_ID:
+                return await update.message.reply_text("⚠️ Не задан ALLOWED_CHAT_ID — некуда публиковать.")
+            await publish_giveaway(context, data)
+            return await update.message.reply_text(
+                f"✅ Конкурс «{esc(data['name'])}» опубликован в чате клана!\n"
+                f"Итоги подведутся автоматически через {data['minutes']} мин.", parse_mode=ParseMode.HTML)
+        return
+
+    # --- Обычный участник в ЛС ---
+    return await update.message.reply_text(
+        f"{pe('catneutral')} Я бот клана {CLAN_NAME}. В личке доступно:\n"
+        "<blockquote>👤 <b>profile</b> — твой баланс, статистика и прогресс\n"
+        "⚖️ <b>appeal</b> — обжаловать наказание (мут/бан/варн)\n"
+        "📜 <b>faq</b> — соглашение и ответы на вопросы\n"
+        "📋 <b>help</b> — список команд клана</blockquote>", parse_mode=ParseMode.HTML)
+
+
+# ============================================================
+#               ТРИГГЕРЫ (как в Iris)
+# ============================================================
+async def handle_triggers(update, context, text, low, parts):
+    first = parts[0]
+    # Управляющие команды владельца работают ВЕЗДЕ (и в чате, и в ЛС). Единый обработчик owner_command.
+    if first in ADMIN_DM_COMMANDS:
+        if await owner_command(update, context, first, parts):
+            return True
+        return False
+    # Гейт соглашения: команды участников недоступны без принятого FAQ (владелец/админы — мимо).
+    # Не блокируем чтение соглашения/справки и обычные сообщения (только известные команды).
+    u = update.effective_user
+    if (u and first in GATED_COMMANDS and not has_agreed(u.id)):
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Принять соглашение", url=faq_deeplink(context))]])
+        await update.message.reply_text(
+            f"{pe('lock')} Чтобы пользоваться ботом клана, сначала прими соглашение — кнопка ниже (откроется бот в личке).",
+            parse_mode=ParseMode.HTML, reply_markup=kb)
+        return True
+    t = resolve_target(update, parts)
+    rest = " ".join(parts[1:]) if len(parts) > 1 else "без указания причины"
+
+    if first in ("profile", "p"):
+        rt = await read_target(update, context, parts)
+        if rt is False:
+            await update.message.reply_text("Не нашёл такого участника. Он должен был хотя бы раз написать в чат после запуска бота.")
+        else:
+            await show_profile(update, context, rt)
+        return True
+    if first in ("top",):
+        await show_top(update, context, parts[1:])
+        return True
+    if first in ("streak", "стрик", "чекин", "checkin"):
+        rt = await read_target(update, context, parts)
+        if rt is False:
+            await update.message.reply_text("Не нашёл такого участника.")
+            return True
+        row = get_user(update.effective_chat.id, rt.id)
+        cur = (row["streak"] or 0) if row else 0
+        best = (row["streak_best"] or 0) if row else 0
+        nxt = next((m for m in sorted(STREAK_MILESTONES) if m > cur), None)
+        who = "Твоя серия" if rt.id == update.effective_user.id else f"Серия <b>{esc(rt.full_name)}</b>"
+        txt = (f"{pe('fire')} {who}: <b>{cur} {_days_word(cur)} подряд</b>\n"
+               f"{pe('star')} Рекорд: <b>{best} {_days_word(best)}</b>")
+        if nxt:
+            txt += f"\n{pe('lp')} Следующая награда — на <b>{nxt}-й день</b> (+{STREAK_MILESTONES[nxt]} LP)"
+        txt += "\n<i>Серия растёт за каждый день, когда ты пишешь в чат. Пропустил день — обнуляется.</i>"
+        await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
+        return True
+    if first in ("season", "сезон"):
+        await show_season(update, context); return True
+    if first in ("hof", "halloffame", "hall"):
+        await show_hall_of_fame(update, context); return True
+    if first in ("menu", "меню"):
+        await menu_cmd(update, context); return True
+    if first in ("orders", "заказы"):
+        if not await require(update, context, ADMIN):
+            return True
+        rows = conn.execute(
+            "SELECT id, name, item, price, ts FROM orders WHERE chat_id=? AND status='pending' ORDER BY id DESC LIMIT 20",
+            (update.effective_chat.id,)).fetchall()
+        if not rows:
+            await update.message.reply_text(f"{pe('check')} Активных заявок нет.", parse_mode=ParseMode.HTML)
+            return True
+        lines = [f"{pe('shop')} <b>Активные заявки магазина</b>"]
+        for o in rows:
+            lines.append(f"#{o['id']} — <b>{esc(o['name'])}</b>: {esc(o['item'])} ({o['price']} LP)")
+        lines.append(f"\n<i>Заявки приходят менеджеру в ЛС с кнопками «Выдано/Отклонить».</i>")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        return True
+    if first in ("poll", "опрос", "голосование"):
+        if not await require(update, context, MODER):
+            return True
+        await make_poll(update, context, text); return True
+    if first in ("shop", "store"):
+        await store_info(update, context); return True
+    if first in ("tag", "brawl"):
+        await cmd_brawl(update, context, parts); return True
+    if first in ("untag", "untie"):
+        ensure_user(update.effective_chat.id, update.effective_user)
+        conn.execute("UPDATE users SET brawl_tag=NULL WHERE chat_id=? AND user_id=?",
+                     (update.effective_chat.id, update.effective_user.id))
+        conn.commit()
+        await update.message.reply_text(f"{pe('check')} Игровой тег отвязан.", parse_mode=ParseMode.HTML)
+        return True
+    if first == "norms":
+        await norms_info(update, context); return True
+    if first in ("docs", "info", "version", "about", "changelog"):
+        await docs_info(update, context); return True
+    if first in ("faq", "terms"):
+        await update.message.reply_text(
+            f"{pe('scroll')} Соглашение и FAQ доступны в личке боту. Напиши мне в ЛС <b>faq</b> — пришлю полный текст.",
+            parse_mode=ParseMode.HTML)
+        return True
+    if first in ("announce",):
+        if await require(update, context, ADMIN):
+            ann = text.split(maxsplit=1)[1].strip() if len(text.split()) > 1 else ""
+            if not ann:
+                await update.message.reply_text("Напиши текст: объявление <текст>")
+            else:
+                try:
+                    await update.message.delete()
+                except Exception:
+                    pass
+                kwargs = {"parse_mode": ParseMode.HTML}
+                if ANNOUNCE_TOPIC_ID:
+                    kwargs["message_thread_id"] = ANNOUNCE_TOPIC_ID
+                await context.bot.send_message(
+                    update.effective_chat.id,
+                    f"{pe('mega')} <b>ОБЪЯВЛЕНИЕ {CLAN_NAME}</b>\n{CLAN_LINE}\n\n{esc(ann)}", **kwargs)
+        return True
+    if first in ("summon", "call"):
+        if await require(update, context, ADMIN):
+            await summon_all(update, context, text)
+        return True
+    if first in ("finish", "endgw") and active_giveaways.get(update.effective_chat.id):
+        await end_giveaway(update, context); return True
+    if first == "who" and t:
+        await update.message.reply_text(
+            f"👤 {esc(t.full_name)}\nID: <code>{t.id}</code>"
+            + (f"\n@{esc(t.username)}" if t.username else ""), parse_mode=ParseMode.HTML)
+        return True
+    if first in ("rules",):
+        await rules_cmd(update, context); return True
+    if first in ("help", "commands"):
+        await help_cmd(update, context); return True
+    if first in ("id", "chatid"):
+        tid = getattr(update.message, "message_thread_id", None)
+        txt = f"ID чата: <code>{update.effective_chat.id}</code>"
+        if tid:
+            txt += f"\nID темы (топика): <code>{tid}</code>"
+        await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
+        return True
+    if first in ("emojiid", "emoji"):
+        rep = update.message.reply_to_message
+        ents = (rep.entities or []) + (rep.caption_entities or []) if rep else []
+        ids = [e.custom_emoji_id for e in ents if getattr(e, "custom_emoji_id", None)]
+        if not rep:
+            await update.message.reply_text(
+                "Чтобы узнать ID премиум-эмодзи: проще всего напиши боту в ЛИЧКУ сообщение с нужными "
+                "анимированными эмодзи — он сразу пришлёт их ID. Либо ответь этой командой на сообщение с эмодзи.",
+                parse_mode=ParseMode.HTML)
+        elif not ids:
+            await update.message.reply_text("В том сообщении нет премиум-эмодзи (нужны именно анимированные из набора, не обычные).")
+        else:
+            report = await emoji_id_report(context, ids)
+            await update.message.reply_text(
+                f"🆔 Премиум-эмодзи ({len(ids)} шт.) — рядом базовый смайлик:\n{report}\n\nСкопируй и пришли мне.",
+                parse_mode=ParseMode.HTML)
+        return True
+
+    # ---- Мини-игры ----
+    if first in ("dice",):
+        await game_dice(update, context, "🎲"); return True
+    if first in ("darts",):
+        await game_dice(update, context, "🎯"); return True
+    if first in ("basket", "basketball"):
+        await game_dice(update, context, "🏀"); return True
+    if first in ("football", "goal"):
+        await game_dice(update, context, "⚽"); return True
+    if first in ("bowling",):
+        await game_dice(update, context, "🎳"); return True
+    if first in ("casino", "slot"):
+        await game_dice(update, context, "🎰"); return True
+    if first in ("coin", "flip"):
+        await update.message.reply_text(f"{pe('lp')} " + random.choice(["Орёл!", "Решка!"]), parse_mode=ParseMode.HTML); return True
+    if first in ("8ball", "ball"):
+        await game_8ball(update, context, " ".join(parts[1:])); return True
+    if first in ("rps",):
+        await game_rps(update, context, parts[1] if len(parts) > 1 else ""); return True
+    if first in ("pick", "choose", "random"):
+        await game_pick(update, context, " ".join(parts[1:])); return True
+    if first in ("number", "guess"):
+        await game_number(update, context, parts[1] if len(parts) > 1 else None); return True
+    if first in ("duel",) and t:
+        await game_duel(update, context, t); return True
+    if first in ("roll",):
+        await update.message.reply_text(f"🎲 Твоё число: {random.randint(1, 100)}"); return True
+
+    # ---- AI ----
+    if first in ("ai", "linkor", "ask"):
+        await ai_ask(update, context, " ".join(parts[1:])); return True
+    if first == "joke":
+        await ai_fun(update, context, "joke"); return True
+    if first == "fact":
+        await ai_fun(update, context, "fact"); return True
+    if first == "toast":
+        await ai_fun(update, context, "toast"); return True
+    if first in ("summary",):
+        await ai_summary(update, context); return True
+
+    if first in ("lp",):
+        has_value = len(parts) > 1 and (parts[1][:1] in "+-=" or parts[1].lstrip("+-=").isdigit())
+        if has_value:
+            # АДМИН: начисление/установка по ответу или @юзеру
+            if not await require(update, context, ADMIN):
+                return True
+            tgt = resolve_target(update, parts)
+            if not tgt:
+                await update.message.reply_text("Кому начислять? Ответь на сообщение участника или укажи @юзера. Пример: lp 200 (ответом).")
+                return True
+            arg = parts[1]
+            ensure_user(update.effective_chat.id, tgt)
+            if arg.startswith("="):
+                try:
+                    val = set_lp(update.effective_chat.id, tgt.id, int(arg[1:]))
+                    await update.message.reply_text(f"{pe('lp')} LP <b>{esc(tgt.full_name)}</b> = <b>{fmt_lp(val)}</b>.", parse_mode=ParseMode.HTML)
+                except ValueError:
+                    await update.message.reply_text("Формат: lp =500")
+            else:
+                try:
+                    val = add_lp(update.effective_chat.id, tgt.id, int(arg))
+                    sign = "+" if int(arg) >= 0 else ""
+                    await update.message.reply_text(f"{pe('lp')} {sign}{arg} LP → <b>{esc(tgt.full_name)}</b>. Баланс: <b>{fmt_lp(val)}</b>.", parse_mode=ParseMode.HTML)
+                except ValueError:
+                    await update.message.reply_text("Формат: lp 200 / lp -50 / lp =500")
+            return True
+        # ЧТЕНИЕ: по умолчанию свой баланс; чужой — только по явному @юзеру (или ответ для модера+)
+        rt = await read_target(update, context, parts)
+        if rt is False:
+            await update.message.reply_text("Не нашёл такого участника. Он должен был хотя бы раз написать в чат после запуска бота.")
+        elif rt.id == update.effective_user.id:
+            row = get_user(update.effective_chat.id, rt.id)
+            await update.message.reply_text(f"{pe('lp')} У тебя <b>{fmt_lp(row['lp'] if row else 0)}</b> LP.", parse_mode=ParseMode.HTML)
+        else:
+            row = get_user(update.effective_chat.id, rt.id)
+            await update.message.reply_text(f"{pe('lp')} У <b>{esc(rt.full_name)}</b>: <b>{fmt_lp(row['lp'] if row else 0)}</b> LP.", parse_mode=ParseMode.HTML)
+        return True
+
+    if text == "+" or first in ("+rep", "rep"):
+        if t:
+            await give_rep(update, context, t)
+            return True
+
+    if text == "-" or first in ("-rep", "-реп", "минусреп"):
+        if t:
+            await give_rep(update, context, t, delta=-1)
+            return True
+
+    if not t:
+        return False
+
+    # --- СЕКРЕТНЫЕ команды начисления LP за игровые нормы (только админ, не в help) ---
+    is_norm_rank = first in ("нормаранг",) or (first == "норма" and len(parts) > 1 and parts[1] in ("ранг", "ранга"))
+    is_norm_cups = first in ("нормакубки",) or (first == "норма" and len(parts) > 1 and parts[1] in ("кубки", "кубков"))
+    if is_norm_rank or is_norm_cups:
+        if await eff_role(update, context) < ADMIN:
+            return False                      # не раскрываем команду обычным участникам
+        amount = NORM_RANK_LP if is_norm_rank else NORM_TROPHY_LP
+        what = "ранга (Легендарный)" if is_norm_rank else "кубков"
+        ensure_user(update.effective_chat.id, t)
+        given, bal = award_lp_capped(update.effective_chat.id, t.id, amount)
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        if given > 0:
+            await context.bot.send_message(
+                update.effective_chat.id,
+                f"{pe('cup')} {mention(t)} выполнил норму {what} — <b>+{fmt_lp(given)} LP</b>!\n"
+                f"{pe('lp')} Баланс: <b>{fmt_lp(bal)}</b> / {LP_MAX} LP", parse_mode=ParseMode.HTML)
+        else:
+            await context.bot.send_message(
+                update.effective_chat.id,
+                f"{pe('cup')} {mention(t)} — норма {what} зачтена, но недельный лимит LP уже достигнут.",
+                parse_mode=ParseMode.HTML)
+        return True
+
+    if first == "отпуск":                              # секретная: пауза норм для участника
+        if await eff_role(update, context) < ADMIN:
+            return False
+        chat_id = update.effective_chat.id
+        ensure_user(chat_id, t)
+        if any(p in ("стоп", "stop", "отмена") for p in parts[1:]):
+            conn.execute("UPDATE users SET vacation_until=NULL WHERE chat_id=? AND user_id=?", (chat_id, t.id))
+            conn.commit()
+            await update.message.reply_text(
+                f"{pe('check')} Отпуск для <b>{esc(t.full_name)}</b> отменён — нормы снова проверяются.",
+                parse_mode=ParseMode.HTML)
+            return True
+        days = next((int(p) for p in parts[1:] if p.isdigit()), None)
+        if not days or days < 1 or days > 30:
+            await update.message.reply_text("Формат: отпуск @юзер 1–30 (дней). Отмена: отпуск @юзер стоп.")
+            return True
+        until = (msk_now().date() + timedelta(days=days)).isoformat()
+        conn.execute("UPDATE users SET vacation_until=? WHERE chat_id=? AND user_id=?", (until, chat_id, t.id))
+        conn.commit()
+        await update.message.reply_text(
+            f"{pe('check')} <b>{esc(t.full_name)}</b> в отпуске от норм на {days} {_days_word(days)} (до {until}). "
+            f"Штрафы и проверки на паузе.", parse_mode=ParseMode.HTML)
+        return True
+
+    if first in ("warn",):
+        if await require(update, context, MODER):
+            await act_warn(update, context, t, rest)
+        return True
+    if first in ("unwarn", "-warn"):
+        if await require(update, context, MODER):
+            await act_unwarn(update, context, t, "" if rest == "без указания причины" else rest)
+        return True
+    if first in ("mute",):
+        minutes, reason = 60, rest
+        if len(parts) > 1:
+            d = parse_duration(parts[1])
+            if d:
+                minutes = d
+                reason = " ".join(parts[2:]) if len(parts) > 2 else "без указания причины"
+        if await require(update, context, MODER):
+            await act_mute(update, context, t, minutes, reason)
+        return True
+    if first in ("unmute",):
+        if await require(update, context, MODER):
+            await act_unmute(update, context, t, "" if rest == "без указания причины" else rest)
+        return True
+    if first in ("kick",):
+        if await require(update, context, MODER):
+            await act_kick(update, context, t)
+        return True
+    if first in ("ban",):
+        if await require(update, context, ADMIN):
+            await act_ban(update, context, t, rest)
+        return True
+    if first in ("unban",):
+        if await require(update, context, ADMIN):
+            await act_unban(update, context, t, "" if rest == "без указания причины" else rest)
+        return True
+    if first in ("clearwarns",):
+        if await require(update, context, ADMIN):
+            clear_warns(update.effective_chat.id, t.id)
+            await update.message.reply_text(f"🧹 Варны <b>{esc(t.full_name)}</b> сброшены.", parse_mode=ParseMode.HTML)
+        return True
+    if first in ("role",):
+        if not await require(update, context, LEADER):
+            return True
+        if len(parts) < 2 or parts[1] not in ROLE_WORDS:
+            await update.message.reply_text("Укажи роль: участник / менеджер / модер / админ / лидер.")
+            return True
+        ensure_user(update.effective_chat.id, t)
+        set_role(update.effective_chat.id, t.id, ROLE_WORDS[parts[1]])
+        await update.message.reply_text(f"🏷 <b>{esc(t.full_name)}</b> теперь: <b>{ROLE_NAMES[ROLE_WORDS[parts[1]]]}</b>.", parse_mode=ParseMode.HTML)
+        return True
+    return False
+
+
+# ============================================================
+#                   AI (DeepSeek)
+# ============================================================
+_ai_cooldown = {}                 # user_id -> время последнего AI-запроса
+_chat_buffer = {}                 # chat_id -> список последних сообщений [(имя, текст)]
+_last_sender = {}                 # chat_id -> [user_id, сколько подряд] — для анти-спама
+_ai_memory = {}                   # (chat_id, user_id) -> последние реплики диалога с помощником
+_last_ai_error = ""               # текст последней ошибки AI (для показа в чате)
+
+CODEX_SUMMARY = (
+    "Правила клана LINKOR: запрещены оскорбления, унижения, оскорбление семьи, "
+    "троллинг и провокации, буллинг, расизм и дискриминация, сексизм, угрозы, "
+    "флуд, спам и реклама, злоупотребление КАПСом, политика и религия, "
+    "вредоносный/мошеннический контент."
+)
+
+
+async def ai_complete(system, user, max_tokens=500, temperature=0.7, history=None):
+    """Запрос к AI (OpenAI-совместимый). None при ошибке/без ключа. Причину пишет в консоль (рус.).
+    history — список предыдущих реплик [{role, content}] для «памяти» диалога."""
+    global _last_ai_error
+    _last_ai_error = ""
+    if not AI_API_KEY:
+        _last_ai_error = "no_key"
+        print("[AI] Ключ не задан (AI_API_KEY пустой).", flush=True)
+        return None
+    url = f"{AI_BASE_URL}/chat/completions"
+    headers = {"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"}
+    messages = [{"role": "system", "content": system}]
+    if history:
+        messages.extend(history)
+    messages.append({"role": "user", "content": user})
+    payload = {"model": AI_MODEL, "max_tokens": max_tokens, "temperature": temperature,
+               "messages": messages}
+    for attempt in range(2):                       # одна авто-повтор при лимите
+        try:
+            async with httpx.AsyncClient(timeout=40) as client:
+                r = await client.post(url, headers=headers, json=payload)
+            if r.status_code == 200:
+                return r.json()["choices"][0]["message"]["content"].strip()
+            if r.status_code == 429:
+                _last_ai_error = "rate_limit"
+                print("[AI] Лимит запросов Cerebras (429): слишком часто/много запросов. "
+                      "Подожди немного или снизь частоту обращений.", flush=True)
+                if attempt == 0:
+                    await asyncio.sleep(2)
+                    continue
+                return None
+            _last_ai_error = "http"
+            print(f"[AI] Ошибка HTTP {r.status_code}: {r.text[:300]}", flush=True)
+            return None
+        except httpx.ConnectError as e:
+            _last_ai_error = "connect"
+            print(f"[AI] Не удалось подключиться к {AI_BASE_URL} "
+                  f"(возможно блокировка по региону — нужен зарубежный IP/VPS): {e}", flush=True)
+            return None
+        except httpx.TimeoutException:
+            _last_ai_error = "timeout"
+            print(f"[AI] Таймаут запроса к {AI_BASE_URL} (медленно или блокировка по региону).", flush=True)
+            return None
+        except Exception as e:
+            _last_ai_error = "other"
+            print(f"[AI] Непредвиденная ошибка: {type(e).__name__}: {e}", flush=True)
+            return None
+    return None
+
+
+def ai_cooldown_left(user_id):
+    last = _ai_cooldown.get(user_id, 0)
+    left = AI_COOLDOWN_SEC - (time.time() - last)
+    return max(0, int(left))
+
+
+async def ai_ask(update, context, question):
+    if not AI_API_KEY:
+        return await update.message.reply_text(f"{pe('robot')} AI пока не подключён (нужен ключ Cerebras в настройках).",
+                                                parse_mode=ParseMode.HTML)
+    if not question.strip():
+        return await update.message.reply_text("Напиши вопрос после слова: Linkor какой бравлер лучший против танков?")
+    left = ai_cooldown_left(update.effective_user.id)
+    if left > 0:
+        return await update.message.reply_text(f"{pe('clock')} Подожди {left} сек перед следующим вопросом к AI.",
+                                                parse_mode=ParseMode.HTML)
+    _ai_cooldown[update.effective_user.id] = time.time()
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+    system = (
+        f"Ты — официальный AI-ассистент игрового клана {CLAN_NAME} по игре Brawl Stars. "
+        f"Общайся вежливо, грамотно и по делу, в сдержанно-официальном, но доброжелательном тоне. "
+        f"Давай точные, полезные и структурированные ответы на русском языке. "
+        f"Не используй markdown-звёздочки. Если вопрос не по теме клана или игры — всё равно помоги корректно и кратко."
+    )
+    key = (update.effective_chat.id, update.effective_user.id)
+    history = _ai_memory.get(key, [])
+    answer = await ai_complete(system, question, history=history)
+    if not answer:
+        # AI не ответил — не штрафуем полным кулдауном, разрешаем повтор через AI_RETRY_SEC
+        _ai_cooldown[update.effective_user.id] = time.time() - max(0, AI_COOLDOWN_SEC - AI_RETRY_SEC)
+    if answer:
+        # запоминаем последние ~3 обмена репликами (память сбрасывается при перезапуске бота)
+        mem = history + [{"role": "user", "content": question[:500]},
+                         {"role": "assistant", "content": answer[:800]}]
+        _ai_memory[key] = mem[-6:]
+        await update.message.reply_text(premiumize(esc(answer)), parse_mode=ParseMode.HTML)
+    elif _last_ai_error == "rate_limit":
+        await update.message.reply_text(f"{pe('robot')} Сейчас слишком много запросов, подожди минутку и спроси снова 🙏",
+                                        parse_mode=ParseMode.HTML)
+    elif _last_ai_error in ("connect", "timeout"):
+        await update.message.reply_text(f"{pe('robot')} Не получается связаться с сервером, попробуй чуть позже.",
+                                        parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text(f"{pe('robot')} Не получилось ответить, попробуй позже.",
+                                        parse_mode=ParseMode.HTML)
+
+
+async def ai_fun(update, context, kind):
+    if not AI_API_KEY:
+        return await update.message.reply_text(f"{pe('robot')} AI пока не подключён (нужен ключ Cerebras в настройках).",
+                                                parse_mode=ParseMode.HTML)
+    left = ai_cooldown_left(update.effective_user.id)
+    if left > 0:
+        return await update.message.reply_text(f"{pe('clock')} Подожди {left} сек.", parse_mode=ParseMode.HTML)
+    _ai_cooldown[update.effective_user.id] = time.time()
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+
+    if kind == "fact":
+        topic = random.choice([
+            "Brawl Stars", "видеоигры и киберспорт", "космос", "животных", "историю",
+            "технологии и интернет", "человеческое тело", "географию и страны", "еду",
+            "океан и природу", "науку", "спорт", "кино и музыку", "изобретения",
+        ])
+        user_prompt = (f"Расскажи ОДИН короткий, неожиданный и малоизвестный факт про {topic}. "
+                       f"Не банальный — такой, чтобы реально удивил. Только сам факт, 1–2 предложения, без вступлений.")
+        sys_prompt = "Ты — эрудит, который удивляет необычными фактами. Каждый раз — новый, не повторяйся. По-русски, без markdown."
+    elif kind == "toast":
+        user_prompt = f"Произнеси короткий заряжающий тост для бойцов клана {CLAN_NAME} (Brawl Stars). 1–2 предложения."
+        sys_prompt = "Ты — харизматичный ведущий клан-чата. По-русски, без markdown."
+    else:  # joke
+        angle = random.choice([
+            "про рандомных тиммейтов", "про вайпы и проигрыши", "про донат и пропуски",
+            "про конкретного бравлера", "про кубковый ад", "про токсичных игроков",
+            "про неудачные супер-удары", "про режимы игры",
+        ])
+        user_prompt = f"Расскажи короткую смешную шутку {angle} в Brawl Stars. Дерзко, по-пацански, 1–3 предложения."
+        sys_prompt = "Ты — остроумный комик игрового чата. Шутки свежие, не повторяйся. По-русски, без markdown."
+
+    answer = await ai_complete(sys_prompt, user_prompt, max_tokens=180, temperature=1.05)
+    if not answer:
+        # AI не ответил — разрешаем повтор через AI_RETRY_SEC, а не через полный кулдаун
+        _ai_cooldown[update.effective_user.id] = time.time() - max(0, AI_COOLDOWN_SEC - AI_RETRY_SEC)
+    await update.message.reply_text(premiumize(esc(answer)) if answer else f"{pe('robot')} Попробуй позже.",
+                                    parse_mode=ParseMode.HTML)
+
+
+async def ai_summary(update, context):
+    if not await require(update, context, MODER):
+        return
+    if not AI_API_KEY:
+        return await update.message.reply_text(f"{pe('robot')} AI пока не подключён (нужен ключ Cerebras).",
+                                                parse_mode=ParseMode.HTML)
+    buf = _chat_buffer.get(update.effective_chat.id, [])
+    if len(buf) < 5:
+        return await update.message.reply_text("Маловато сообщений для сводки.")
+    # на бесплатном тарифе Cerebras контекст 8K — берём последние ~30 сообщений и обрезаем
+    transcript = "\n".join(f"{n}: {tx}" for n, tx in buf[-30:])
+    transcript = transcript[-6000:]
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+    sys_prompt = (
+        "Ты — аналитик чата игрового клана LINKOR. Делаешь ёмкую, структурированную и полезную сводку "
+        "обсуждения по-русски. Только то, что реально было в сообщениях — ничего не выдумывай. "
+        "Без markdown-звёздочек, пиши живым языком."
+    )
+    user_prompt = (
+        "Сделай сводку последних сообщений чата СТРОГО в таком формате, каждый блок с новой строки:\n\n"
+        "🔥 Главное — 2–4 коротких пункта о ключевых темах (каждый с новой строки, начинай с «• »)\n"
+        "💬 Атмосфера — одна короткая фраза о настроении в чате\n"
+        "⭐ Активнее всех — 2–3 имени, если заметно по сообщениям (иначе пропусти этот блок)\n"
+        "📌 Итоги — если были договорённости/решения, кратко; иначе напиши «без конкретных решений»\n\n"
+        f"Вот сообщения:\n{transcript}"
+    )
+    answer = await ai_complete(sys_prompt, user_prompt, max_tokens=500, temperature=0.6)
+    if not answer:
+        return await update.message.reply_text(f"{pe('robot')} Не вышло собрать сводку, попробуй позже.",
+                                                parse_mode=ParseMode.HTML)
+    body = esc(answer)
+    # заменяем обычные значки из AI-вывода на премиум-эмодзи
+    for plain, nm in (("🔥", "fire"), ("💬", "msg"), ("⭐", "star"), ("📌", "pin"),
+                      ("🏆", "cup"), ("📊", "stats")):
+        body = body.replace(plain, pe(nm))
+    await update.message.reply_text(
+        f"{pe('note')} <b>СВОДКА ОБСУЖДЕНИЯ — {CLAN_NAME}</b>\n{CLAN_LINE}\n\n"
+        f"<blockquote>{body}</blockquote>", parse_mode=ParseMode.HTML)
+
+
+async def ai_moderate(update, context):
+    """AI-распознавание нарушений в речи. Возвращает True, если приняты меры."""
+    if not (AI_MODERATION and AI_API_KEY):
+        return False
+    msg = update.message
+    user = update.effective_user
+    if len(msg.text) < 4:
+        return False
+    system = (
+        "Ты — модератор русскоязычного игрового чата клана, где РАЗРЕШЕНЫ мат, грубые и "
+        "крепкие словечки. За обычную брань, шутки и самовыражение наказывать НЕЛЬЗЯ. "
+        "Нарушением считается ТОЛЬКО одно из двух:\n"
+        "1) Прямое оскорбление, унижение или переход на личности В АДРЕС КОНКРЕТНОГО человека "
+        "(например адресная травля, унижение конкретного участника).\n"
+        "2) Намеренное разжигание конфликта, провокации, подстрекательство к ссоре.\n"
+        "Мат сам по себе, крепкие выражения и эмоции, НЕ направленные на унижение конкретного "
+        "человека, — это НЕ нарушение (violation=false). "
+        "Если сомневаешься — считай, что нарушения НЕТ. "
+        "Ответь СТРОГО в JSON без пояснений: "
+        '{"violation": true/false, "rule": "краткая причина", "severity": "low|med|high"}.')
+    raw = await ai_complete(system, msg.text, max_tokens=120, temperature=0.0)
+    if not raw:
+        return False
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    try:
+        verdict = json.loads(raw)
+    except Exception:
+        return False
+    if not verdict.get("violation") or verdict.get("severity") not in ("med", "high"):
+        return False
+    rule = str(verdict.get("rule", "нарушение правил"))[:120]
+    if AI_MOD_AUTOPUNISH:
+        # та же лестница: выговор → мут → варн → исключение
+        await apply_discipline(update, context, user, f"{rule} (AI)", MUTE_HOURS_INSULT, delete_msg=True)
+    else:
+        await msg.reply_text(f"{pe('robot')} Кажется, это нарушает правила ({esc(rule)}). Будь, пожалуйста, аккуратнее.",
+                             parse_mode=ParseMode.HTML)
+    return True
+
+
+# ============================================================
+#                   МИНИ-ИГРЫ
+# ============================================================
+EIGHTBALL = [
+    "Бесспорно ✅", "Мне кажется — да", "Никаких сомнений", "Можешь быть уверен",
+    "Скорее всего", "Хорошие перспективы", "Знаки говорят — да",
+    "Пока неясно, попробуй снова 🤔", "Спроси позже", "Лучше не рассказывать сейчас",
+    "Даже не думай ❌", "Мой ответ — нет", "Очень сомнительно", "Не рассчитывай на это",
+]
+RPS = {"камень": 0, "ножницы": 1, "бумага": 2}
+RPS_EMOJI = ["🪨 Камень", "✂️ Ножницы", "📄 Бумага"]
+
+
+async def game_dice(update, context, emoji):
+    await update.message.reply_dice(emoji=emoji)
+
+
+async def game_8ball(update, context, question):
+    if not question:
+        return await update.message.reply_text("Задай вопрос: шар будет ли сегодня ивент?")
+    await update.message.reply_text("🎱 " + random.choice(EIGHTBALL))
+
+
+async def game_rps(update, context, choice):
+    if choice not in RPS:
+        return await update.message.reply_text("Выбери: кнб камень / кнб ножницы / кнб бумага")
+    me = random.randint(0, 2)
+    you = RPS[choice]
+    if me == you:
+        res = "Ничья 🤝"
+    elif (you - me) % 3 == 2:        # ты бьёшь то, что выбрал бот
+        res = "Ты победил! 🎉"
+    else:
+        res = "Я победил 😎"
+    await update.message.reply_text(f"Ты: {RPS_EMOJI[you]}\nЯ: {RPS_EMOJI[me]}\n\n{res}")
+
+
+async def game_pick(update, context, items_text):
+    items = [x.strip() for x in re.split(r"[,/]| или ", items_text) if x.strip()]
+    if len(items) < 2:
+        return await update.message.reply_text("Дай варианты через запятую: выбери пицца, суши, бургер")
+    await update.message.reply_text(f"🎯 Мой выбор: <b>{esc(random.choice(items))}</b>", parse_mode=ParseMode.HTML)
+
+
+async def game_duel(update, context, t):
+    me_name = update.effective_user.full_name
+    winner = random.choice([me_name, t.full_name])
+    await update.message.reply_text(
+        f"⚔️ <b>Дуэль!</b>\n{esc(me_name)} 🆚 {esc(t.full_name)}\n\n🏆 Победитель: <b>{esc(winner)}</b>",
+        parse_mode=ParseMode.HTML)
+
+
+async def game_number(update, context, guess_text):
+    secret = random.randint(1, 10)
+    try:
+        g = int(guess_text)
+    except (ValueError, TypeError):
+        return await update.message.reply_text("Угадай число 1–10: число 7")
+    await update.message.reply_text(f"🎲 Загадано {secret}. " + ("Угадал! 🎉" if g == secret else "Мимо!"))
+
+
+# ============================================================
+#                   АВТОМОДЕРАЦИЯ
+# ============================================================
+_flood = {}
+
+
+async def apply_discipline(update, context, user, reason, mute_hours, delete_msg=False):
+    """Прогрессивное наказание по кодексу: выговор → мут → варн → (3 варна) исключение."""
+    chat_id = update.effective_chat.id
+    ensure_user(chat_id, user)
+    row = get_user(chat_id, user.id)
+    stage = row["disc_stage"] if row else 0
+    # сброс стадии после 7 дней без нарушений
+    if row and row["disc_last"]:
+        try:
+            if msk_now() - datetime.fromisoformat(row["disc_last"]) > timedelta(days=DISCIPLINE_DECAY_DAYS):
+                stage = 0
+        except Exception:
+            pass
+    if delete_msg:
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+    if stage == 0:
+        # 1) устный выговор
+        conn.execute("UPDATE users SET disc_stage=1, disc_last=? WHERE chat_id=? AND user_id=?",
+                     (msk_now().isoformat(), chat_id, user.id))
+        conn.commit()
+        await context.bot.send_message(
+            chat_id, f"✋ <b>{esc(user.full_name)}</b>, устное предупреждение: {esc(reason)}.\n"
+                     f"При повторном нарушении — мут.", parse_mode=ParseMode.HTML)
+    elif stage == 1:
+        # 2) мут
+        await do_mute(context, chat_id, user.id, mute_hours * 60)
+        conn.execute("UPDATE users SET disc_stage=2, disc_last=? WHERE chat_id=? AND user_id=?",
+                     (msk_now().isoformat(), chat_id, user.id))
+        conn.commit()
+        await context.bot.send_message(
+            chat_id, f"🔇 <b>{esc(user.full_name)}</b> — мут на {mute_hours} ч за повторное нарушение: {esc(reason)}.\n"
+                     f"Следующее нарушение — варн.", parse_mode=ParseMode.HTML)
+    else:
+        # 3) варн (+ списание LP); 3 варна — исключение
+        n = add_warn(chat_id, user.id)
+        bal = add_lp(chat_id, user.id, -WARN_LP_PENALTY)
+        conn.execute("UPDATE users SET disc_last=? WHERE chat_id=? AND user_id=?",
+                     (msk_now().isoformat(), chat_id, user.id))
+        conn.commit()
+        if n >= MAX_WARNS:
+            clear_warns(chat_id, user.id)
+            conn.execute("UPDATE users SET disc_stage=0 WHERE chat_id=? AND user_id=?", (chat_id, user.id))
+            conn.commit()
+            await do_exclude(context, chat_id, user.id)
+            await context.bot.send_message(
+                chat_id, f"⛔ <b>{esc(user.full_name)}</b> исключён из чата (3 варна, кодекс 4.3). Причина: {esc(reason)}.",
+                parse_mode=ParseMode.HTML)
+        else:
+            await context.bot.send_message(
+                chat_id, f"⚠ <b>{esc(user.full_name)}</b> — варн {n}/{MAX_WARNS} за: {esc(reason)}.\n"
+                         f"🔻 Списано {WARN_LP_PENALTY} LP (баланс: {fmt_lp(bal)}).", parse_mode=ParseMode.HTML)
+
+
+async def auto_moderate(update, context):
+    msg = update.message
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    if await eff_role(update, context) >= MODER:     # админы/модеры — полный иммунитет
+        return
+    if NO_MODERATION_TOPIC_ID and getattr(msg, "message_thread_id", None) == NO_MODERATION_TOPIC_ID:
+        return                                        # топик "cherdak linkor" — без наказаний
+    text = msg.text
+
+    # 1) Мат/оскорбления из списка (мгновенно, бесплатно, ловит обход)
+    if has_banned(text):
+        await apply_discipline(update, context, user, "оскорбления / мат (кодекс 1.1)",
+                               MUTE_HOURS_INSULT, delete_msg=True)
+        return
+
+    # 2) КАПС
+    letters = [c for c in text if c.isalpha()]
+    if len(letters) >= CAPS_MIN_LEN and sum(c.isupper() for c in letters) / len(letters) >= CAPS_RATIO:
+        await apply_discipline(update, context, user, "злоупотребление КАПСом (кодекс 1.10)", MUTE_HOURS_CAPS)
+        return
+
+    # 3) Флуд
+    key = (chat_id, user.id)
+    now = time.time()
+    times = [tt for tt in _flood.get(key, []) if now - tt < FLOOD_WINDOW]
+    times.append(now)
+    _flood[key] = times
+    if len(times) >= FLOOD_LIMIT:
+        _flood[key] = []
+        await apply_discipline(update, context, user, "флуд (кодекс 1.8)", MUTE_HOURS_FLOOD)
+        return
+
+    # 4) AI-распознавание оскорблений в речи (если включено и есть ключ)
+    await ai_moderate(update, context)
+
+
+# ============================================================
+#               ОХРАНА ЧАТА (только свой чат)
+# ============================================================
+async def guard(update, context):
+    chat = update.effective_chat
+    if not chat:
+        raise ApplicationHandlerStop
+    if chat.type == "private":
+        return                                # личку обрабатывает private_router (обжалования, помощь, конкурсы)
+    if ALLOWED_CHAT_ID and chat.id != ALLOWED_CHAT_ID:
+        try:
+            await context.bot.leave_chat(chat.id)
+        except Exception:
+            pass
+        raise ApplicationHandlerStop
+
+
+# ============================================================
+#               ОБРАБОТЧИКИ СООБЩЕНИЙ
+# ============================================================
+async def maybe_finalize_season(context, chat_id):
+    """Если начался новый месяц — подводит итоги прошлого сезона: топ-3 в зал славы + LP + анонс.
+    Без планировщика: срабатывает при первом сообщении в новом месяце."""
+    if not ALLOWED_CHAT_ID or chat_id != ALLOWED_CHAT_ID:
+        return
+    cur = current_season()
+    last = meta_get("season_cur")
+    if last is None:
+        meta_set("season_cur", cur)                 # первый запуск — просто запоминаем сезон
+        return
+    if last == cur:
+        return                                       # сезон не сменился
+    # месяц сменился — подводим итоги прошлого сезона `last`
+    if not meta_get(f"season_done_{last}"):
+        top = [r for r in season_top(chat_id, last, 3) if r["val"] > 0]
+        if top:
+            medals = [pe("gold"), pe("silver"), pe("bronze")]
+            now_iso = msk_now().isoformat()
+            lines = []
+            for i, r in enumerate(top):
+                rank = i + 1
+                bonus = SEASON_REWARDS.get(rank, 0)
+                conn.execute(
+                    "INSERT INTO hall_of_fame (chat_id, season, rank, user_id, name, score, ts) VALUES (?,?,?,?,?,?,?)",
+                    (chat_id, last, rank, r["user_id"], r["name"], int(r["val"]), now_iso))
+                if bonus and r["user_id"] not in EXCLUDED_IDS:
+                    add_lp(chat_id, r["user_id"], bonus)
+                lines.append(f"{medals[i]} <b>{esc(r['name'])}</b> — {r['val']} сообщ. (+{bonus} LP)")
+            conn.commit()
+            try:
+                await context.bot.send_message(
+                    chat_id,
+                    f"{pe('cup')} <b>СЕЗОН «{season_title(last)}» ЗАВЕРШЁН — {CLAN_NAME}</b>\n{CLAN_LINE}\n\n"
+                    f"{pe('crown')} <b>Победители сезона:</b>\n" + "\n".join(lines) + "\n\n"
+                    f"{pe('star')} Они занесены в зал славы (<code>hof</code>). Новый сезон «{season_title(cur)}» начался — "
+                    f"топ обнулён, у всех равные шансы. Погнали! {pe('fire')}",
+                    parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+        meta_set(f"season_done_{last}", "1")
+    meta_set("season_cur", cur)
+
+
+async def run_norm_snapshot(context, chat_id):
+    """Начало недели: помечаем всех участников (для нормы активности) и снимаем кубки у привязанных."""
+    monday = week_bounds()[0]
+    # отметка присутствия на начало недели — для всех, кроме админов вне экономики (нужно для нормы активности)
+    excl = tuple(EXCLUDED_IDS) or (0,)
+    ph = ",".join("?" * len(excl))
+    conn.execute(f"UPDATE users SET norm_anchor_week=? WHERE chat_id=? AND user_id NOT IN ({ph})",
+                 (monday, chat_id, *excl))
+    conn.commit()
+    # снимок кубков — только у привязанных (и не в отпуске)
+    rows = conn.execute(
+        "SELECT user_id, brawl_tag, vacation_until FROM users WHERE chat_id=? AND brawl_tag IS NOT NULL AND brawl_tag<>''",
+        (chat_id,)).fetchall()
+    for r in rows:
+        if on_vacation(r):
+            continue
+        try:
+            data = await brawl_fetch(r["brawl_tag"])
+        except Exception:
+            data = None
+        if not data:
+            continue
+        tro = int(data.get("trophies", 0))
+        conn.execute("UPDATE users SET trophy_base=?, trophy_base_week=?, brawl_trophies=?, brawl_name=? WHERE chat_id=? AND user_id=?",
+                     (tro, monday, tro, data.get("name"), chat_id, r["user_id"]))
+    conn.commit()
+
+
+async def run_norm_check(context, chat_id, announce=True):
+    """Проверка норм за неделю: кубки (у привязанных) и активность (у всех). Штраф −LP за каждую
+    проваленную норму + максимум один норм-варн в неделю; 3 норм-варна → исключение. Мягкий старт — без штрафов."""
+    monday = week_bounds()[0]
+    soft = soft_start_active()
+    rows = conn.execute(
+        "SELECT user_id, name, brawl_tag, trophy_base, trophy_base_week, vacation_until, norm_anchor_week "
+        "FROM users WHERE chat_id=?", (chat_id,)).fetchall()
+    cup_done, cup_failed = [], []          # (имя, прирост[, варн])
+    act_done, act_failed = [], []          # (имя, сообщений)
+    excluded = []
+    for r in rows:
+        uid = r["user_id"]
+        if uid in EXCLUDED_IDS or uid == LEADER_ID or on_vacation(r):
+            continue
+        if r["norm_anchor_week"] != monday:
+            continue                                       # вступил в середине недели / не был на старте — пропуск
+        failed_any = False
+        # --- НОРМА КУБКОВ (только у привязанных со снимком этой недели) ---
+        if r["brawl_tag"] and r["trophy_base_week"] == monday and r["trophy_base"] is not None:
+            try:
+                data = await brawl_fetch(r["brawl_tag"])
+            except Exception:
+                data = None
+            if data:                                       # если API недоступен — кубки в этот раз не проверяем
+                gain = int(data.get("trophies", 0)) - int(r["trophy_base"])
+                if gain >= WEEKLY_TROPHY_NORM:
+                    add_lp(chat_id, uid, NORM_TROPHY_LP)
+                    cup_done.append((r["name"], gain))
+                elif soft:
+                    cup_failed.append((r["name"], gain, 0))
+                else:
+                    add_lp(chat_id, uid, -NORM_FAIL_PENALTY)
+                    failed_any = True
+                    cup_failed.append((r["name"], gain, None))
+        # --- НОРМА АКТИВНОСТИ (у всех присутствовавших на старте недели) ---
+        msgs = stat_week(chat_id, uid)
+        if msgs >= WEEKLY_MSG_NORM:
+            act_done.append((r["name"], msgs))
+        elif soft:
+            act_failed.append((r["name"], msgs))
+        else:
+            add_lp(chat_id, uid, -NORM_FAIL_PENALTY)
+            failed_any = True
+            act_failed.append((r["name"], msgs))
+        # --- НОРМ-ВАРН: максимум один в неделю, если провалена хотя бы одна норма ---
+        if failed_any and not soft:
+            nw = add_norm_warn(chat_id, uid)
+            if nw >= NORM_WARN_LIMIT:
+                try:
+                    await do_exclude(context, chat_id, uid)
+                except Exception:
+                    pass
+                conn.execute("DELETE FROM norm_warns WHERE chat_id=? AND user_id=?", (chat_id, uid))
+                conn.commit()
+                excluded.append(r["name"])
+    if announce and (cup_done or cup_failed or act_done or act_failed or excluded):
+        P = [f"{pe('cup')} <b>ИТОГИ НЕДЕЛИ — НОРМЫ ({CLAN_NAME})</b>\n{CLAN_LINE}"]
+        if soft:
+            P.append(f"{pe('bulb')} <i>Мягкий старт: штрафы и норм-варны пока не применяются.</i>")
+        # кубки
+        P.append(f"\n{pe('cup')} <b>Кубки</b> (норма +{WEEKLY_TROPHY_NORM}/нед):")
+        if cup_done:
+            P.append(f"{pe('check')} Выполнили (+{NORM_TROPHY_LP} LP): " + ", ".join(f"{esc(n)} (+{g})" for n, g in cup_done))
+        if cup_failed:
+            P.append(f"{pe('cross')} Не выполнили" + ("" if soft else f" (−{NORM_FAIL_PENALTY} LP)") + ": " +
+                     ", ".join(f"{esc(n)} (+{g})" for n, g, _w in cup_failed))
+        if not cup_done and not cup_failed:
+            P.append("<i>— некого проверять (нет снимков кубков)</i>")
+        # активность
+        P.append(f"\n{pe('msg')} <b>Активность</b> (норма {WEEKLY_MSG_NORM} сообщ./нед):")
+        if act_done:
+            P.append(f"{pe('check')} Выполнили: <b>{len(act_done)}</b>")
+        if act_failed:
+            P.append(f"{pe('cross')} Не выполнили" + ("" if soft else f" (−{NORM_FAIL_PENALTY} LP)") + ": " +
+                     ", ".join(f"{esc(n)} ({m})" for n, m in act_failed[:15]) + (f" и ещё {len(act_failed)-15}" if len(act_failed) > 15 else ""))
+        if excluded:
+            P.append(f"\n{pe('ban')} <b>Исключены</b> (3 норм-варна за месяц): " + ", ".join(esc(n) for n in excluded))
+        try:
+            await context.bot.send_message(chat_id, "\n".join(P), parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+    return len(cup_done) + len(act_done), len(cup_failed) + len(act_failed), len(excluded)
+
+
+async def maybe_citadel_bonus(context, chat_id):
+    """Разовое начисление всем участникам +CITADEL_BONUS_LP за запуск «Цитадели». Срабатывает один раз."""
+    if not ALLOWED_CHAT_ID or chat_id != ALLOWED_CHAT_ID:
+        return
+    if meta_get("citadel_bonus_done"):
+        return
+    meta_set("citadel_bonus_done", "1")                # ставим флаг сразу — чтобы не повторилось
+    rows = conn.execute("SELECT user_id FROM users WHERE chat_id=?", (chat_id,)).fetchall()
+    n = 0
+    for r in rows:
+        if r["user_id"] in EXCLUDED_IDS or r["user_id"] == LEADER_ID:
+            continue
+        add_lp(chat_id, r["user_id"], CITADEL_BONUS_LP)
+        n += 1
+    try:
+        await context.bot.send_message(
+            chat_id,
+            f"{pe('crown')} <b>Спасибо за терпение!</b>\n{CLAN_LINE}\n"
+            f"В честь завершения большого обновления <b>«Цитадель»</b> и за ваше терпение во время долгих "
+            f"техработ — каждому участнику <b>+{CITADEL_BONUS_LP} LP</b>! {pe('lp')}\n"
+            f"Начислено <b>{n}</b> участникам. Дальше — только лучше! {pe('fire')}",
+            parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+
+
+async def maybe_norm_cycle(context, chat_id):
+    """Авто-снимок по понедельникам и авто-проверка по воскресеньям (фоном, без планировщика)."""
+    if not ALLOWED_CHAT_ID or chat_id != ALLOWED_CHAT_ID:
+        return
+    if today_str() < NORMS_START_DATE:                 # нормы стартуют только с даты старта
+        return
+    now = msk_now()
+    monday, sunday = week_bounds()
+    if now.weekday() == 0 and not meta_get(f"snapshot_{monday}"):     # понедельник
+        meta_set(f"snapshot_{monday}", "1")
+        asyncio.create_task(run_norm_snapshot(context, chat_id))
+    if now.weekday() == 6 and now.hour >= 21 and not meta_get(f"normcheck_{sunday}"):  # вс ≥21:00
+        meta_set(f"normcheck_{sunday}", "1")
+        asyncio.create_task(run_norm_check(context, chat_id))
+
+
+async def send_weekly_report(context, chat_id):
+    """Строит и отправляет отчёт за текущую неделю (без проверок времени — для авто и ручного вызова)."""
+    mon, sun = week_bounds()
+    excl = tuple(EXCLUDED_IDS) or (0,)
+    ph = ",".join("?" * len(excl))
+    rows = conn.execute(
+        f"SELECT u.name, u.user_id, COALESCE(SUM(s.cnt),0) AS val FROM users u "
+        f"LEFT JOIN stats s ON s.chat_id=u.chat_id AND s.user_id=u.user_id AND s.day BETWEEN ? AND ? "
+        f"WHERE u.chat_id=? AND u.user_id NOT IN ({ph}) GROUP BY u.user_id ORDER BY val DESC",
+        (mon, sun, chat_id, *excl)).fetchall()
+    if not rows:
+        return False
+    medals = {0: pe("gold"), 1: pe("silver"), 2: pe("bronze")}
+    top = [r for r in rows if r["val"] > 0][:5]
+    top_lines = [f"<b>{i+1}.</b> {medals.get(i, pe('star'))} {esc(r['name'])} — <b>{r['val']}</b>"
+                 for i, r in enumerate(top)]
+    met = [r for r in rows if r["val"] >= WEEKLY_MSG_NORM]
+    below = [r for r in rows if 0 < r["val"] < WEEKLY_MSG_NORM]
+    below_names = ", ".join(esc(r["name"]) for r in below[:12])
+    if len(below) > 12:
+        below_names += f" и ещё {len(below) - 12}"
+    text = (f"{pe('calendar')} <b>ИТОГИ НЕДЕЛИ — {CLAN_NAME}</b> <i>(Пн–Вс)</i>\n{CLAN_LINE}\n\n"
+            f"{pe('cup')} <b>Самые активные:</b>\n"
+            + ("\n".join(top_lines) if top_lines else "— тишина в чате —") + "\n\n")
+    if today_str() >= NORMS_START_DATE:                 # норму активности показываем только с даты старта
+        text += f"{pe('check')} Норму {WEEKLY_MSG_NORM}+ выполнили: <b>{len(met)}</b>\n"
+        if below:
+            text += f"{pe('warn')} Не дотянули норму: {below_names}\n"
+    text += f"\n{pe('fire')} Новая неделя — новые цели. Погнали!"
+    try:
+        await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+        return True
+    except Exception:
+        return False
+
+
+async def maybe_weekly_report(context, chat_id):
+    """Воскресный авто-отчёт клана (вс ≥20:00 МСК), один раз в неделю. Без планировщика."""
+    if not ALLOWED_CHAT_ID or chat_id != ALLOWED_CHAT_ID:
+        return
+    now = msk_now()
+    if now.weekday() != 6 or now.hour < 20:        # 6 = воскресенье
+        return
+    _, sun = week_bounds()
+    key = f"weekreport_{sun}"
+    if conn.execute("SELECT 1 FROM meta WHERE key=?", (key,)).fetchone():
+        return
+    conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, '1')", (key,))
+    conn.commit()
+    await send_weekly_report(context, chat_id)
+
+
+async def counter(update, context):
+    if not update.effective_user or update.effective_user.is_bot:
+        return
+    if not update.effective_chat or update.effective_chat.type == "private":
+        return
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    try:
+        ensure_user(chat_id, user)
+        stat_add(chat_id, user.id)
+    except Exception:
+        return
+    # буфер последних сообщений для AI-сводки
+    if update.message and update.message.text:
+        buf = _chat_buffer.setdefault(chat_id, [])
+        buf.append((user.full_name, update.message.text[:300]))
+        if len(buf) > 60:
+            del buf[:len(buf) - 60]
+    # ЭКОНОМИКА: LP капают за каждое сообщение (молча), но:
+    #  • не более чем за MSG_DAILY_CAP сообщений в день (дневной антиспам-потолок);
+    #  • если человек пишет подряд сам с собой (никто не отвечает) дольше SELF_SPAM_LIMIT — LP не идут (анти-фарм).
+    try:
+        ls = _last_sender.get(chat_id)
+        if ls and ls[0] == user.id:
+            ls[1] += 1
+        else:
+            _last_sender[chat_id] = [user.id, 1]
+            ls = _last_sender[chat_id]
+        if stat_today(chat_id, user.id) <= MSG_DAILY_CAP and ls[1] <= SELF_SPAM_LIMIT:
+            add_lp(chat_id, user.id, LP_PER_MESSAGE)
+    except Exception:
+        pass
+    # Ежедневный стрик (чек-ин при первом сообщении за день)
+    try:
+        res = touch_streak(chat_id, user)
+        if res:
+            streak, bonus = res
+            if bonus > 0:   # достигнута веха серии — поздравляем в чате
+                await update.message.reply_text(
+                    f"{pe('fire')} <b>{esc(user.full_name)}</b> — серия активности <b>{streak} "
+                    f"{_days_word(streak)} подряд</b>! {pe('lp')} +{bonus} LP", parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    # Бонус за «Цитадель» — только вручную командой bonusall. Воскресный авто-отчёт убран
+    # (дублировал команду top). Итоги сезона при смене месяца (фоном при сообщениях)
+    try:
+        await maybe_finalize_season(context, chat_id)
+    except Exception:
+        pass
+    # Норм-цикл: снимок кубков (Пн) и проверка нормы (Вс) — фоном
+    try:
+        await maybe_norm_cycle(context, chat_id)
+    except Exception:
+        pass
+    # Тег-гейт: новичок без привязанного тега получает предупреждения (3 дня → исключение)
+    try:
+        await check_tag_gate(update, context, user)
+    except Exception:
+        pass
+
+
+async def text_router(update, context):
+    msg = update.message
+    if not msg or not msg.text:
+        return
+    raw = msg.text.strip()
+    # В чате команды срабатывают ТОЛЬКО с префиксом-точкой (.help, .profile, .Linkor ...).
+    # Сообщения без точки — обычная речь: командой не считаются (но в статистике/LP учитываются отдельно).
+    if CMD_PREFIX and raw.startswith(CMD_PREFIX):
+        text = raw[len(CMD_PREFIX):].strip()
+        low = text.lower()
+        parts = low.split()
+        if parts and await handle_triggers(update, context, text, low, parts):
+            return
+    await auto_moderate(update, context)
+
+
+async def record_member(update, context):
+    """Записывает участников по служебным событиям (вход/выход/смена статуса),
+    чтобы со временем «summon» охватывал больше людей."""
+    try:
+        cm = update.chat_member or update.my_chat_member
+        if not cm or not cm.chat or cm.chat.id != ALLOWED_CHAT_ID:
+            return
+        member = cm.new_chat_member.user if cm.new_chat_member else None
+        if not member or member.is_bot:
+            return
+        status = cm.new_chat_member.status
+        # активные статусы — фиксируем участника; вышедших/забаненных не добавляем
+        if status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR,
+                      ChatMemberStatus.OWNER, ChatMemberStatus.RESTRICTED):
+            ensure_user(ALLOWED_CHAT_ID, member)
+    except Exception:
+        pass
+
+
+async def welcome(update, context):
+    for member in update.message.new_chat_members:
+        if member.is_bot:
+            continue
+        ensure_user(update.effective_chat.id, member)
+        # новичок попадает под тег-гейт (обязан привязать тег); старичков это не трогает
+        conn.execute("UPDATE users SET tag_gate=1 WHERE chat_id=? AND user_id=?",
+                     (update.effective_chat.id, member.id))
+        conn.commit()
+        # анти-рейд: при наплыве входов новичок ограничивается и обычное приветствие пропускаем
+        if await check_raid(context, update.effective_chat.id, member):
+            continue
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Открыть бота и принять соглашение", url=faq_deeplink(context))]])
+        await update.message.reply_text(
+            f"{pe('catlove')} <b>Добро пожаловать в клан {CLAN_NAME}!</b>\n{CLAN_LINE}\n"
+            f"Рады видеть тебя, {mention(member)} {pe('hug')}\n\n"
+            f"{pe('excl')} <b>Два обязательных шага:</b>\n"
+            f"<blockquote>1. Прими соглашение — кнопка ниже (открой бота в ЛС).\n"
+            f"2. Привяжи игровой тег: <code>.tag #ТВОЙ_ТЕГ</code> (на это есть 3 дня, иначе авто-исключение).</blockquote>\n"
+            f"<blockquote>{pe('scroll')} <b>rules</b> — кодекс · {pe('excl')} <b>norms</b> — нормы кубков\n"
+            f"{pe('person')} <b>profile</b> · {pe('shop')} <b>shop</b> · {pe('robot')} <b>help</b></blockquote>\n"
+            f"Общайся в чате — за сообщения капают {pe('lp')} LP. С 22 июня действует норма кубков (+1450/нед). "
+            f"Удачи в боях! {pe('fire')}",
+            parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+# ============================================================
+#               СЛЕШ-КОМАНДЫ
+# ============================================================
+async def start_cmd(update, context):
+    user = update.effective_user
+    if user:
+        ensure_user(ALLOWED_CHAT_ID, user)
+    # Кто ещё НЕ принял — показываем соглашение с кнопками (заход по ссылке start=agree тоже сюда).
+    if user and not has_agreed(user.id):
+        return await send_faq_agreement(update, context)
+    # Кто уже принял (или владелец/админ) — обычное приветствие, кнопки повторно НЕ показываем.
+    await update.message.reply_text(
+        f"{pe('crown')} <b>Официальный бот клана {CLAN_NAME}</b>\n"
+        f"Модерация · статистика · LP · конкурсы · игры · AI\n\n"
+        f"{pe('check')} Соглашение уже принято — бот тебе полностью доступен.\n"
+        f"В личке: <code>.profile</code> · <code>.appeal</code> · <code>.faq</code> · <code>.help</code>", parse_mode=ParseMode.HTML)
+
+
+async def id_cmd(update, context):
+    tid = getattr(update.message, "message_thread_id", None)
+    txt = f"ID чата: <code>{update.effective_chat.id}</code>"
+    if tid:
+        txt += f"\nID темы (топика): <code>{tid}</code>"
+    await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
+
+
+def _help_member_text():
+    return (
+        f"━━━━━━━━━━━━━━━━\n"
+        f"{pe('person')} <b>БОТ КЛАНА {CLAN_NAME} — КОМАНДЫ</b>\n"
+        f"━━━━━━━━━━━━━━━━\n\n"
+        f"{pe('person')} <b>Профиль и статистика</b>\n"
+        "• <code>profile</code> (свой), <code>profile @юзер</code> или ответом — чужой\n"
+        "• <code>lp</code> — твой баланс · <code>+</code> (ответом) — репутация\n"
+        f"• <code>.tag #ТВОЙТЕГ</code> — привязать профиль Brawl Stars {pe('game')}\n"
+        "• <code>top active</code> · <code>top lp</code> · <code>top rep</code> · <code>top trophies</code> (можно <code>day</code>/<code>week</code>)\n"
+        f"• <code>streak</code> — твоя серия дней подряд {pe('fire')}\n"
+        f"• <code>season</code> — топ сезона (месяца) · <code>hof</code> — зал славы {pe('cup')}\n"
+        f"• <code>menu</code> — меню с кнопками {pe('crown')}\n\n"
+        f"{pe('shop')} <b>Клан</b>\n"
+        "• <code>shop</code> — STORE и как получать LP\n"
+        "• <code>norms</code> — обязательные нормы клана\n"
+        "• <code>rules</code> — кодекс · <code>docs</code> — о боте\n"
+        "• <code>faq</code> — соглашение и FAQ (в личке боту)\n\n"
+        f"{pe('robot')} <b>AI</b>: <code>Linkor &lt;вопрос&gt;</code> · <code>joke</code> · <code>fact</code> · <code>toast</code>\n\n"
+        f"{pe('game')} <b>Игры</b>: <code>dice</code> · <code>darts</code> · <code>basket</code> · <code>football</code> · "
+        "<code>bowling</code> · <code>casino</code> · <code>coin</code> · <code>8ball &lt;вопрос&gt;</code> · "
+        "<code>rps камень</code> · <code>pick a, b, c</code> · <code>number 7</code> · <code>duel</code> · <code>roll</code>\n\n"
+        f"{pe('scales')} <b>Наказание?</b> Обжаловать можно в личке боту — напиши <code>appeal</code>.\n\n"
+        f"ℹ️ Статистика — по МСК. {pe('lp')} LP капают за каждое сообщение: чем активнее каждый день, тем больше. "
+        f"Норма клана — {WEEKLY_MSG_NORM} сообщ./нед."
+    )
+
+
+def _help_admin_text():
+    return (
+        f"━━━━━━━━━━━━━━━━\n"
+        f"{pe('shield')} <b>АДМИН-КОМАНДЫ {CLAN_NAME}</b>\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        "Модерация (ответом или <code>@юзер</code>):\n"
+        "• <code>warn причина</code> · <code>unwarn причина</code> · <code>clearwarns</code>\n"
+        "• <code>mute 2ч причина</code> · <code>unmute причина</code> · <code>kick</code>\n"
+        "  <i>длительность: <code>30м</code> (минуты) · <code>12ч</code> (часы) · <code>7д</code> (дни)</i>\n"
+        "• <code>ban причина</code> · <code>unban причина</code>\n\n"
+        "Управление:\n"
+        "• <code>role модер</code> — назначить роль\n"
+        "• <code>lp 200</code> / <code>lp -50</code> / <code>lp =500</code> — изменить LP\n"
+        "• <code>who</code> — ID и имя участника · <code>summary</code> — AI-итог чата\n"
+        "• <code>announce текст</code> — пост от лица бота\n"
+        "• <code>summon текст</code> — сбор: пингует всех известных участников (или <code>call</code>)\n"
+        "• <code>конкурс</code> — создать конкурс (в ЛИЧКЕ боту)\n\n"
+        f"{pe('folder')} <b>Управление (владелец, в чате и в личке):</b>\n"
+        "• <code>modlog</code> — журнал действий модерации\n"
+        "• <code>analytics</code> — сводка по клану (активность, LP, топы)\n"
+        "• <code>backup</code> — прислать бэкап базы в личку\n"
+        "• <code>bonusall 150</code> — начислить LP ВСЕМ участникам\n"
+        "• <code>checknorms</code> / <code>snapshotnorms</code> — проверка/снимок норм\n\n"
+        f"{pe('msg')} <b>Модерация и опрос — в чате:</b> <code>poll Вопрос? | вар1 | вар2</code>\n"
+        f"{pe('shield')} <b>Анти-рейд</b> включается автоматически при наплыве входов.\n\n"
+        f"{pe('cup')} <b>Нормы (кубки + активность, с 22 июня):</b>\n"
+        "• Снимок — авто по понедельникам, проверка — авто в воскресенье\n"
+        "• <code>отпуск @юзер 1–30</code> — пауза норм для участника (<code>отпуск @юзер стоп</code> — отменить)\n\n"
+        f"{pe('crown')} <b>Секретные награды</b> (ответом/@юзер):\n"
+        "• <code>норма ранг</code> — +LP за норму ранга · <code>норма кубки</code> — +LP за норму кубков\n\n"
+        f"{pe('envelope')} <b>Обжалования</b> приходят тебе в личку с кнопками «Одобрить/Отклонить»."
+    )
+
+
+def help_menu_keyboard(owner_id):
+    """Кнопочное меню справки. owner_id — кто открыл (жать может только он)."""
+    u = owner_id
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👤 Профиль и статистика", callback_data=f"help:profile:{u}")],
+        [InlineKeyboardButton("🛒 Клан", callback_data=f"help:clan:{u}"),
+         InlineKeyboardButton("🎮 Игры", callback_data=f"help:games:{u}")],
+        [InlineKeyboardButton("🤖 AI", callback_data=f"help:ai:{u}"),
+         InlineKeyboardButton("⚖️ Обжалование", callback_data=f"help:appeal:{u}")],
+        [InlineKeyboardButton("🛡 Админ-команды", callback_data=f"help:admin:{u}")],
+    ])
+
+
+def _help_intro():
+    return (f"{pe('person')} <b>СПРАВКА — БОТ КЛАНА {CLAN_NAME}</b>\n{CLAN_LINE}\n"
+            f"<i>Все команды пишутся с точкой в начале: <code>.help</code>, <code>.profile</code> …</i>\n"
+            f"<i>Выбери раздел кнопкой — команды откроются прямо здесь.</i>\n"
+            f"{pe('lp')} LP капают за каждое сообщение · статистика по МСК")
+
+
+def _help_section(key):
+    """Текст одного раздела справки (в сворачиваемой цитате). Команды — с точкой-префиксом."""
+    if key == "profile":
+        return (f"{pe('person')} <b>Профиль и статистика</b>\n<blockquote expandable>"
+                "• <code>.profile</code> — твой профиль (или <code>.profile @юзер</code> / ответом — чужой)\n"
+                "• <code>.lp</code> — твой баланс LP\n"
+                "• <code>.+</code> (ответом) — дать репутацию · <code>.-</code> — снять\n"
+                "• <code>.tag #ТВОЙТЕГ</code> — привязать профиль Brawl Stars\n"
+                "• <code>.top active</code> · <code>.top lp</code> · <code>.top rep</code> · <code>.top trophies</code> (+ <code>day</code>/<code>week</code>)\n"
+                "• <code>.streak</code> — серия дней подряд\n"
+                "• <code>.season</code> — топ сезона · <code>.hof</code> — зал славы</blockquote>")
+    if key == "clan":
+        return (f"{pe('shop')} <b>Клан</b>\n<blockquote expandable>"
+                "• <code>.shop</code> — магазин и как получать LP\n"
+                "• <code>.norms</code> — обязательные нормы клана\n"
+                "• <code>.rules</code> — кодекс клана\n"
+                "• <code>.docs</code> — о боте и история обновлений\n"
+                "• <code>.faq</code> — соглашение и FAQ (в личке боту)</blockquote>")
+    if key == "games":
+        return (f"{pe('game')} <b>Игры</b>\n<blockquote expandable>"
+                "<code>.dice</code> · <code>.darts</code> · <code>.basket</code> · <code>.football</code> · <code>.bowling</code> · "
+                "<code>.casino</code> · <code>.coin</code> · <code>.8ball &lt;вопрос&gt;</code> · <code>.rps камень</code> · "
+                "<code>.pick a, b, c</code> · <code>.number 7</code> · <code>.duel</code> · <code>.roll</code></blockquote>")
+    if key == "ai":
+        return (f"{pe('robot')} <b>AI-помощник</b>\n<blockquote expandable>"
+                "• <code>.Linkor &lt;вопрос&gt;</code> — спросить AI про Brawl Stars или что угодно\n"
+                "• <code>.joke</code> — шутка · <code>.fact</code> — факт · <code>.toast</code> — тост\n"
+                "<i>Без точки слово «linkor» в обычной речи AI не вызывает.</i></blockquote>")
+    if key == "appeal":
+        return (f"{pe('scales')} <b>Обжалование наказания</b>\n<blockquote expandable>"
+                "Получил наказание и считаешь его несправедливым? Напиши боту "
+                "<b>в личку</b> команду <code>.appeal</code> — заявка с твоим объяснением уйдёт администрации, "
+                "и они решат вопрос.</blockquote>")
+    if key == "admin":
+        return (f"{pe('shield')} <b>Админ-команды</b> <i>(работают только у администрации)</i>\n<blockquote expandable>"
+                "<b>Модерация</b> (ответом/<code>@юзер</code>): <code>.warn</code> · <code>.unwarn</code> · "
+                "<code>.clearwarns</code> · <code>.mute 12ч причина</code> · <code>.unmute</code> · <code>.kick</code> · "
+                "<code>.ban</code> · <code>.unban</code>\n"
+                "<i>длительность: <code>30м</code> · <code>12ч</code> · <code>7д</code></i>\n\n"
+                "<b>Управление:</b> <code>.role модер</code> · <code>.lp 200</code>/<code>.lp -50</code>/<code>.lp =500</code> · "
+                "<code>.who</code> · <code>.summary</code> · <code>.announce текст</code> · <code>.summon текст</code> · "
+                "<code>.конкурс</code> (в личке)\n\n"
+                "<b>Владелец</b> (в чате и в личке): <code>.modlog</code> · <code>.analytics</code> · <code>.backup</code> · "
+                "<code>.bonusall 150</code> · <code>.checknorms</code> · <code>.snapshotnorms</code>\n\n"
+                "<b>Опрос:</b> <code>.poll Вопрос? | вар1 | вар2</code>\n"
+                "<b>Нормы</b> (с 22 июня): авто по Пн/Вс · <code>.отпуск @юзер 1–30</code>\n"
+                "<b>Награды</b> (ответом): <code>.норма ранг</code> · <code>.норма кубки</code></blockquote>")
+    return _help_intro()
+
+
+async def help_cmd(update, context, include_admin=False):
+    kb = help_menu_keyboard(update.effective_user.id)
+    try:
+        await update.message.reply_text(_help_intro(), parse_mode=ParseMode.HTML, reply_markup=kb)
+    except Exception as e:
+        print(f"[HELP] ошибка отправки справки: {e}", flush=True)
+        try:
+            await update.message.reply_text(f"Справка {CLAN_NAME}. Выбери раздел кнопкой.", reply_markup=kb)
+        except Exception:
+            pass
+
+
+async def rules_cmd(update, context):
+    await update.message.reply_text(
+        f"━━━━━━━━━━━━━━━━\n"
+        f"{pe('scroll')} <b>КОДЕКС КЛАНА {CLAN_NAME}</b>\n"
+        f"━━━━━━━━━━━━━━━━\n\n"
+        "<b>I. Культура общения</b>\nБез оскорблений, троллинга, буллинга, угроз, расизма, "
+        "сексизма, спама и злоупотребления КАПСом.\n\n"
+        "<b>II. Дисциплина</b>\nУчастие в событиях, выполнение норм активности, без саботажа.\n\n"
+        "<b>III. Иерархия</b>\nЛидер → Администрация → Модераторы → Менеджеры → Участники.\n\n"
+        "<b>IV. Наказания</b>\nВыговор → мут → варн → исключение. 3 варна = исключение.\n\n"
+        "<i>Полный кодекс — у администрации клана.</i>",
+        parse_mode=ParseMode.HTML)
+
+
+async def profile_cmd(update, context):
+    await show_profile(update, context, target_user(update) or update.effective_user)
+
+
+async def roll_cmd(update, context):
+    await update.message.reply_text(f"🎲 Твоё число: {random.randint(1,100)}")
+
+
+async def coin_cmd(update, context):
+    await update.message.reply_text(f"{pe('lp')} " + random.choice(["Орёл!", "Решка!"]), parse_mode=ParseMode.HTML)
+
+
+async def dice_cmd(update, context):
+    await update.message.reply_dice()
+
+
+async def guess_cmd(update, context):
+    secret = random.randint(1, 10)
+    if not context.args:
+        return await update.message.reply_text("Напиши /guess <число от 1 до 10>")
+    try:
+        g = int(context.args[0])
+    except ValueError:
+        return await update.message.reply_text("Это не число 🙂")
+    await update.message.reply_text(f"🎉 Угадал! Было {secret}." if g == secret else f"Мимо! Было {secret}.")
+
+
+# ============================================================
+#                       ЗАПУСК
+# ============================================================
+async def error_handler(update, context):
+    """Ловит ошибки в обработчиках, чтобы бот не падал от сетевых сбоев."""
+    err = context.error
+    try:
+        from telegram.error import NetworkError, TimedOut, RetryAfter, Conflict
+    except Exception:
+        NetworkError = TimedOut = RetryAfter = Conflict = ()
+    if Conflict and isinstance(err, Conflict):
+        print("=" * 60, flush=True)
+        print("[КОНФЛИКТ] Telegram сообщает: бота опрашивает ДРУГОЙ экземпляр!", flush=True)
+        print("Значит ОДНОВРЕМЕННО запущено 2+ копии бота (часто старый контейнер на хостинге).", flush=True)
+        print("Из-за этого баланс/топы прыгают. Оставь РОВНО ОДНУ копию — удали лишние приложения.", flush=True)
+        print("=" * 60, flush=True)
+    elif isinstance(err, (NetworkError, TimedOut)):
+        print(f"[СЕТЬ] Временная проблема связи с Telegram ({err}). "
+              f"Проверь интернет/DNS на машине с ботом. Бот продолжает работу.", flush=True)
+    elif isinstance(err, RetryAfter):
+        print(f"[ЛИМИТ] Telegram просит подождать {getattr(err, 'retry_after', '?')} сек. Бот продолжает работу.", flush=True)
+    else:
+        print(f"[ОШИБКА] {type(err).__name__}: {err}", flush=True)
+
+
+async def show_modlog(update, context, parts):
+    """Журнал последних действий модерации (для владельца; работает везде)."""
+    chat_id = ALLOWED_CHAT_ID
+    rows = conn.execute(
+        "SELECT admin_name, target_name, action, reason, ts FROM modlog WHERE chat_id=? ORDER BY id DESC LIMIT 15",
+        (chat_id,)).fetchall()
+    if not rows:
+        return await update.message.reply_text(
+            f"{pe('folder')} <b>ЖУРНАЛ МОДЕРАЦИИ {CLAN_NAME}</b>\n{CLAN_LINE}\n<i>Пока пусто — наказаний не было.</i>",
+            parse_mode=ParseMode.HTML)
+    act_emoji = {"бан": "🚫", "ban": "🚫", "мут": "🔇", "mute": "🔇", "варн": "⚠️", "warn": "⚠️",
+                 "кик": "👢", "kick": "👢", "разбан": "✅", "размут": "🔊", "снят": "✅"}
+    lines = [f"{pe('folder')} <b>ЖУРНАЛ МОДЕРАЦИИ {CLAN_NAME}</b>\n{CLAN_LINE}\n<i>Последние {len(rows)} действий:</i>\n"]
+    for r in rows:
+        d = (r["ts"] or "")[:16].replace("T", " ")
+        ic = next((v for k, v in act_emoji.items() if k in (r["action"] or "").lower()), "•")
+        rsn = f"\n   <i>причина: {esc(r['reason'])}</i>" if r["reason"] else ""
+        lines.append(f"{ic} <b>{esc(r['target_name'])}</b> — {esc(r['action'])}\n"
+                     f"   <code>{d}</code> · модератор: {esc(r['admin_name'])}{rsn}")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def make_poll(update, context, text):
+    """Создаёт нативный опрос Telegram. Формат: poll Вопрос? | вариант1 | вариант2 [| ...]"""
+    raw = text.split(maxsplit=1)
+    if len(raw) < 2:
+        return await update.message.reply_text(
+            "Формат: <code>poll Вопрос? | вариант 1 | вариант 2</code>\nБез вариантов будет «Да / Нет».",
+            parse_mode=ParseMode.HTML)
+    chunks = [p.strip() for p in raw[1].split("|") if p.strip()]
+    question = chunks[0]
+    options = chunks[1:] if len(chunks) >= 3 else ["Да", "Нет"]
+    options = options[:10]
+    try:
+        await context.bot.send_poll(update.effective_chat.id, question[:300], options, is_anonymous=False)
+    except Exception:
+        await update.message.reply_text("Не получилось создать опрос. Проверь формат и права бота.")
+
+
+async def clan_analytics(update, context):
+    """Сводная аналитика по клану (для владельца, в личке)."""
+    chat_id = ALLOWED_CHAT_ID
+    today = today_str()
+    mon, sun = week_bounds()
+    def one(q, a=()):
+        return conn.execute(q, a).fetchone()[0]
+    members = one("SELECT COUNT(*) FROM users WHERE chat_id=?", (chat_id,))
+    act_today = one("SELECT COUNT(DISTINCT user_id) FROM stats WHERE chat_id=? AND day=?", (chat_id, today))
+    act_week = one("SELECT COUNT(DISTINCT user_id) FROM stats WHERE chat_id=? AND day BETWEEN ? AND ?", (chat_id, mon, sun))
+    m_today = one("SELECT COALESCE(SUM(cnt),0) FROM stats WHERE chat_id=? AND day=?", (chat_id, today))
+    m_week = one("SELECT COALESCE(SUM(cnt),0) FROM stats WHERE chat_id=? AND day BETWEEN ? AND ?", (chat_id, mon, sun))
+    m_total = one("SELECT COALESCE(SUM(cnt),0) FROM stats WHERE chat_id=?", (chat_id,))
+    tagged = one("SELECT COUNT(*) FROM users WHERE chat_id=? AND brawl_tag IS NOT NULL", (chat_id,))
+    total_lp = one("SELECT COALESCE(SUM(lp),0) FROM users WHERE chat_id=?", (chat_id,))
+    top = [r for r in season_top(chat_id, current_season(), 3) if r["val"] > 0]
+    medals = [pe("gold"), pe("silver"), pe("bronze")]
+    top_lines = "\n".join(f"{medals[i]} {esc(r['name'])} — {r['val']}" for i, r in enumerate(top)) or "—"
+    await update.message.reply_text(
+        f"{pe('stats')} <b>АНАЛИТИКА {CLAN_NAME}</b>\n{CLAN_LINE}\n"
+        f"<blockquote>{pe('person')} Участников в базе: <b>{members}</b>\n"
+        f"{pe('game')} С привязанным тегом: <b>{tagged}</b>\n"
+        f"{pe('fire')} Активны сегодня: <b>{act_today}</b> · за неделю: <b>{act_week}</b></blockquote>\n"
+        f"<blockquote>{pe('msg')} Сообщений сегодня: <b>{fmt_num(m_today)}</b>\n"
+        f"{pe('calendar')} За неделю: <b>{fmt_num(m_week)}</b>\n"
+        f"{pe('stats')} Всего: <b>{fmt_num(m_total)}</b></blockquote>\n"
+        f"<blockquote>{pe('lp')} LP в обороте: <b>{fmt_num(total_lp)}</b></blockquote>\n"
+        f"{pe('growth')} <b>Топ активных за месяц:</b>\n{top_lines}",
+        parse_mode=ParseMode.HTML)
+
+
+async def send_backup(update, context):
+    """Отправляет файл базы владельцу в ЛС (резервная копия перед деплоем)."""
+    if update.effective_user.id != LEADER_ID:
+        return await update.message.reply_text("Бэкап базы может делать только владелец клана.")
+    try:
+        conn.execute("PRAGMA wal_checkpoint(FULL)")
+        conn.commit()
+    except Exception:
+        pass
+    try:
+        with open(DB_FILE, "rb") as f:
+            await context.bot.send_document(
+                LEADER_ID, document=f, filename=f"linkor_backup_{today_str()}.db",
+                caption=f"{pe('folder')} <b>Бэкап базы {CLAN_NAME}</b>\nДата: {today_str()}",
+                parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            f"{pe('check')} <b>Бэкап готов.</b> Файл базы отправлен тебе в личку.", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await update.message.reply_text(f"{pe('cross')} Не удалось отправить бэкап: {esc(str(e))}", parse_mode=ParseMode.HTML)
+
+
+async def on_unknown_callback(update, context):
+    """Подстраховка: отвечает на любой колбэк, не пойманный другими обработчиками (чтобы кнопка не зависала)."""
+    cq = update.callback_query
+    try:
+        print(f"[CB] НЕ ПОЙМАН колбэк: {cq.data!r} от {cq.from_user.id}", flush=True)
+        await cq.answer()
+    except Exception:
+        pass
+
+
+def main():
+    init_db()
+    app = Application.builder().token(TOKEN).build()
+    app.add_error_handler(error_handler)
+
+    app.add_handler(MessageHandler(filters.ALL, guard), group=-1)
+    app.add_handler(MessageHandler(filters.ALL & ~filters.StatusUpdate.ALL, counter), group=1)
+
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("id", id_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("rules", rules_cmd))
+    app.add_handler(CommandHandler("profile", profile_cmd))
+    app.add_handler(CommandHandler("roll", roll_cmd))
+    app.add_handler(CommandHandler("coin", coin_cmd))
+    app.add_handler(CommandHandler("dice", dice_cmd))
+    app.add_handler(CommandHandler("guess", guess_cmd))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
+    app.add_handler(ChatMemberHandler(record_member, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(CallbackQueryHandler(giveaway_join, pattern="^gw_join$"))
+    app.add_handler(CallbackQueryHandler(on_action_callback, pattern="^(menu|buy|order|appeal|faq|help):"))
+    app.add_handler(CallbackQueryHandler(on_unknown_callback))   # подстраховка: любой не пойманный колбэк
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, private_router))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, text_router))
+
+    boot_id = random.randint(1000, 9999)
+    print(f"Бот клана LINKOR запущен (boot-id {boot_id}). Ctrl+C для остановки.", flush=True)
+    print(f"Если в логах два разных boot-id или ошибка [КОНФЛИКТ] — запущено несколько копий бота!", flush=True)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
