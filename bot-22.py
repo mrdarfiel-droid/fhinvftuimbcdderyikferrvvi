@@ -2199,12 +2199,15 @@ async def on_action_callback(update, context):
         action = parts[1] if len(parts) > 1 else ""
         owner_id = int(parts[2]) if len(parts) > 2 and parts[2].lstrip("-").isdigit() else user.id
         if user.id != owner_id:
-            return await cq.answer("Эту справку открыл другой игрок. Открой свою — напиши: help", show_alert=True)
+            return await cq.answer("Эту справку открыл другой игрок. Открой свою — напиши: .help", show_alert=True)
+        staff = await can_use_admin(context, user.id)
+        if action == "admin" and not staff:
+            return await cq.answer("Этот раздел только для администрации.", show_alert=True)
         await cq.answer()
         if action in ("menu", "back"):
             try:
                 await cq.edit_message_text(_help_intro(), parse_mode=ParseMode.HTML,
-                                           reply_markup=help_menu_keyboard(owner_id))
+                                           reply_markup=help_menu_keyboard(owner_id, staff))
             except Exception:
                 pass
             return
@@ -2371,6 +2374,46 @@ async def is_staff(context, user_id):
         return False
 
 
+def is_bot_staff(user_id):
+    """Админ по ВНУТРЕННЕЙ роли бота (MODER+) или из штата. НЕ по телеграм-админке:
+    в этом чате титулы у всех, значит почти все — телеграм-админы, и проверять по ней нельзя.
+    Используется, чтобы прятать админ-команды от обычных участников."""
+    if user_id in ({LEADER_ID} | CONTEST_CREATORS | STORE_ADMINS | EXCLUDED_IDS):
+        return True
+    try:
+        return get_role(ALLOWED_CHAT_ID, user_id) >= MODER
+    except Exception:
+        return False
+
+
+# Доступ к админ-командам бота (видимость в help + право вызова):
+#   False — владелец + штат бота + администраторы клан-чата (как реальные права на выполнение)
+#   True  — ТОЛЬКО владелец бота (самый строгий режим)
+ADMIN_OWNER_ONLY = False
+
+
+async def can_use_admin(context, user_id):
+    """Единая проверка: кто видит и может вызывать админ-команды бота.
+    По умолчанию совпадает с правами на ВЫПОЛНЕНИЕ (eff_role): владелец + штат + админы клан-чата.
+    Если ADMIN_OWNER_ONLY=True — доступ только у владельца бота."""
+    if user_id == LEADER_ID:
+        return True
+    if ADMIN_OWNER_ONLY:
+        return False
+    if user_id in (CONTEST_CREATORS | STORE_ADMINS | EXCLUDED_IDS):
+        return True
+    try:
+        if get_role(ALLOWED_CHAT_ID, user_id) >= MODER:
+            return True
+    except Exception:
+        pass
+    try:
+        m = await context.bot.get_chat_member(ALLOWED_CHAT_ID, user_id)
+        return m.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR)
+    except Exception:
+        return False
+
+
 async def can_appeal(context, user_id):
     """Может ли писать обжалование: он есть/был в чате клана (включая забаненных/в муте)."""
     if get_user(ALLOWED_CHAT_ID, user_id):
@@ -2502,8 +2545,9 @@ async def private_router(update, context):
     if not user:
         return
     text = (update.message.text or "").strip()
-    # В личке точка-префикс необязательна: если человек написал «.profile» — срежем точку и поймём как «profile».
-    if CMD_PREFIX and len(text) > 1 and text.startswith(CMD_PREFIX) and not text.startswith(CMD_PREFIX * 2):
+    # В личке команды тоже с точкой. Запоминаем, была ли она, и срезаем.
+    had_dot = bool(CMD_PREFIX) and len(text) > 1 and text.startswith(CMD_PREFIX) and not text.startswith(CMD_PREFIX * 2)
+    if had_dot:
         text = text[len(CMD_PREFIX):].strip()
     low = text.lower()
     is_creator = user.id in CONTEST_CREATORS
@@ -2544,6 +2588,12 @@ async def private_router(update, context):
         context.user_data.pop("appeal_state", None)
         return await submit_appeal(update, context, text)
 
+    # --- В личке команды тоже только с точкой. Без точки и без активного процесса — это не команда. ---
+    if not had_dot and not gw_state and not appeal_state:
+        return await update.message.reply_text(
+            f"{pe('person')} Команды пишутся с точкой в начале: <code>.help</code>, <code>.profile</code>, "
+            f"<code>.appeal</code> …", parse_mode=ParseMode.HTML)
+
     # --- Старт обжалования (для участников клана) ---
     if low in ("appeal",):
         if not await can_appeal(context, user.id):
@@ -2558,10 +2608,9 @@ async def private_router(update, context):
             "Напиши всё одним сообщением — я передам администрации. Для отмены — «отмена».",
             parse_mode=ParseMode.HTML)
 
-    # --- Помощь в ЛС (админам — с админ-командами) ---
+    # --- Помощь в ЛС (админам — кнопка админ-команд показывается автоматически) ---
     if low in ("help", "commands", "menu"):
-        staff = await is_staff(context, user.id)
-        return await help_cmd(update, context, include_admin=staff)
+        return await help_cmd(update, context)
 
     # --- Личный кабинет в ЛС (профиль/баланс/прогресс) ---
     if low in ("profile", "p", "lp", "balance", "cabinet"):
@@ -3848,17 +3897,20 @@ def _help_admin_text():
     )
 
 
-def help_menu_keyboard(owner_id):
-    """Кнопочное меню справки. owner_id — кто открыл (жать может только он)."""
+def help_menu_keyboard(owner_id, staff=False):
+    """Кнопочное меню справки. owner_id — кто открыл (жать может только он).
+    staff=True добавляет кнопку «Админ-команды» (обычным участникам она не видна)."""
     u = owner_id
-    return InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton("👤 Профиль и статистика", callback_data=f"help:profile:{u}")],
         [InlineKeyboardButton("🛒 Клан", callback_data=f"help:clan:{u}"),
          InlineKeyboardButton("🎮 Игры", callback_data=f"help:games:{u}")],
         [InlineKeyboardButton("🤖 AI", callback_data=f"help:ai:{u}"),
          InlineKeyboardButton("⚖️ Обжалование", callback_data=f"help:appeal:{u}")],
-        [InlineKeyboardButton("🛡 Админ-команды", callback_data=f"help:admin:{u}")],
-    ])
+    ]
+    if staff:
+        rows.append([InlineKeyboardButton("🛡 Админ-команды", callback_data=f"help:admin:{u}")])
+    return InlineKeyboardMarkup(rows)
 
 
 def _help_intro():
@@ -3919,7 +3971,8 @@ def _help_section(key):
 
 
 async def help_cmd(update, context, include_admin=False):
-    kb = help_menu_keyboard(update.effective_user.id)
+    staff = include_admin or await can_use_admin(context, update.effective_user.id)
+    kb = help_menu_keyboard(update.effective_user.id, staff)
     try:
         await update.message.reply_text(_help_intro(), parse_mode=ParseMode.HTML, reply_markup=kb)
     except Exception as e:
@@ -4097,9 +4150,31 @@ async def on_unknown_callback(update, context):
         pass
 
 
+async def on_startup(app):
+    """Автопроверка: после запуска бот пишет владельцу в личку — какая версия и когда поднялась.
+    Если сообщение пришло — значит на сервере уже работает свежий код (а не старая сборка)."""
+    boot_id = app.bot_data.get("boot_id", "—")
+    try:
+        when = msk_now().strftime("%d.%m.%Y · %H:%M")
+        await app.bot.send_message(
+            chat_id=LEADER_ID,
+            text=(f"{pe('check')} <b>LINKOR BOSS v{BOT_VERSION} «{PATCH_NAME}» запущен!</b>\n"
+                  f"{pe('clock')} Старт: <b>{when}</b> (МСК) · сборка <code>{boot_id}</code>\n"
+                  f"<blockquote expandable>Это сообщение приходит при КАЖДОМ запуске. Пришло — значит "
+                  f"на сервере уже свежий код.\n"
+                  f"Новинки этой версии: команды только с точкой (<code>.help</code>), "
+                  f"админ-команды видны и доступны только администрации.</blockquote>"),
+            parse_mode=ParseMode.HTML)
+    except Exception as e:
+        print(f"[STARTUP] не смог уведомить владельца ({LEADER_ID}): {e} — "
+              f"возможно, владелец ещё не открывал личку с ботом.", flush=True)
+
+
 def main():
     init_db()
-    app = Application.builder().token(TOKEN).build()
+    boot_id = random.randint(1000, 9999)
+    app = Application.builder().token(TOKEN).post_init(on_startup).build()
+    app.bot_data["boot_id"] = boot_id
     app.add_error_handler(error_handler)
 
     app.add_handler(MessageHandler(filters.ALL, guard), group=-1)
@@ -4107,13 +4182,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("id", id_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("rules", rules_cmd))
-    app.add_handler(CommandHandler("profile", profile_cmd))
-    app.add_handler(CommandHandler("roll", roll_cmd))
-    app.add_handler(CommandHandler("coin", coin_cmd))
-    app.add_handler(CommandHandler("dice", dice_cmd))
-    app.add_handler(CommandHandler("guess", guess_cmd))
+    # Слэш-дубли команд убраны намеренно: все команды работают только с точкой (.help, .profile, .rules, .roll …).
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
     app.add_handler(ChatMemberHandler(record_member, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(CallbackQueryHandler(giveaway_join, pattern="^gw_join$"))
@@ -4122,7 +4191,6 @@ def main():
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, private_router))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, text_router))
 
-    boot_id = random.randint(1000, 9999)
     print(f"Бот клана LINKOR запущен (boot-id {boot_id}). Ctrl+C для остановки.", flush=True)
     print(f"Если в логах два разных boot-id или ошибка [КОНФЛИКТ] — запущено несколько копий бота!", flush=True)
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
