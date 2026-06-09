@@ -225,8 +225,8 @@ CITADEL_BONUS_LP = 150
 # Имя бота — всегда LINKOR BOSS. UPDATE_NAME — название большого обновления (5.x = «Цитадель»).
 # Версия (5.2) — это патч в рамках этого обновления.
 BOT_FULL_NAME = "LINKOR BOSS"
-BOT_VERSION = "5.2"
-PATCH_CODE = "LB-5.2"
+BOT_VERSION = "5.5"
+PATCH_CODE = "LB-5.5"
 UPDATE_NAME = "Цитадель"        # название большого обновления (вся ветка 5.x)
 PATCH_NAME = UPDATE_NAME        # для совместимости со старым кодом
 PATCH_TYPE = "обновление"
@@ -237,6 +237,19 @@ RELEASE_DATE = "06.06.2026"
 # История изменений ДЛЯ УЧАСТНИКОВ по версиям (новые сверху). Без админских/секретных команд.
 # Формат: (версия, тип, [пункты])
 CHANGELOG_HISTORY = [
+    ("5.5", "обновление", [
+        "🌙 Ночью бот тоже сам подбирает гифку — в спокойной теме (спящие котики / «спокойной ночи»). Утром бодрые котики, ночью — уютные.",
+    ]),
+    ("5.4", "обновление", [
+        "📅 Листание прошлых топов: команда «топ день» показывает топ активности за сегодня, а стрелками можно листать прошлые дни (до недели назад).",
+        "☀️ Тексты приветствий теперь зависят от дня недели: в пятницу про выходные, в понедельник про новую неделю и т.д. — живее и без шаблона.",
+        "😻 Утренняя гифка с котиком подбирается автоматически — каждый день свежая, искать ничего не нужно (плюс осталась копилка своих гифок).",
+        "📖 Раздел «docs» стал листаемым: главная информация всегда на месте, а изменения версий перелистываются стрелками.",
+    ]),
+    ("5.3", "обновление", [
+        "🌅 Авто-приветствия по Москве: в 8:00 бот желает доброго утра (с датой, тёплым текстом и мини-итогом вчерашнего дня), а в 22:00 — спокойной ночи и мягкий ночной режим. Тексты каждый день разные.",
+        "⭐ Первого, кто написал утром, бот отмечает в чате — небольшое соревнование «кто раньше» подстёгивает актив.",
+    ]),
     ("5.2", "обновление", [
         "🛒 Магазин стал кнопочным: короткое сообщение и разделы (как получать LP, за рубли, правила) открываются прямо в нём же — а товары всегда под рукой одной кнопкой.",
         "🧹 Топы теперь чистятся сами: как только участник выходит из клана, он автоматически убирается из всех топов, LP и статистики — в рейтингах только нынешние бойцы. Вышедших ранее можно убрать разом (у администрации есть команда).",
@@ -468,6 +481,8 @@ def _add_col(table, col, decl):
 
 
 def init_db():
+    conn.execute("""CREATE TABLE IF NOT EXISTS greeting_gifs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, file_id TEXT, ts TEXT)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS users (
         chat_id INTEGER, user_id INTEGER, username TEXT, name TEXT,
         gems INTEGER DEFAULT 0, reputation INTEGER DEFAULT 0,
@@ -1870,8 +1885,8 @@ async def norms_info(update, context):
         parse_mode=ParseMode.HTML)
 
 
-async def docs_info(update, context):
-    await update.message.reply_text(
+def _docs_header():
+    return (
         f"{pe('folder')} <b>ДОКУМЕНТАЦИЯ — {BOT_FULL_NAME}</b>\n{CLAN_LINE}\n\n"
         f"{pe('robot')} Бот: <b>{BOT_FULL_NAME}</b> · версия <b>{BOT_VERSION}</b> ({PATCH_CODE})\n"
         f"{pe('shield')} Обновление: <b>«{UPDATE_NAME}»</b> · тип: {PATCH_TYPE}\n"
@@ -1882,25 +1897,99 @@ async def docs_info(update, context):
         f"{pe('scroll')} <b>О боте</b>\n"
         f"<blockquote>Бот клана {CLAN_NAME}: модерация по кодексу, система LP, статистика "
         f"активности, конкурсы, магазин и AI-помощник.</blockquote>\n"
-        f"{pe('bulb')} Нашёл баг или есть идея — пиши {BOT_ADMIN}.\n"
-        f"{pe('star')} <b>История изменений</b> — ниже ⤵️",
-        parse_mode=ParseMode.HTML)
-    # История изменений: каждая версия — в раскрывающейся цитате (свёрнута, чтобы не засорять чат).
-    # Разбиваем на сообщения, чтобы не упереться в лимит Telegram (4096 символов).
-    ver_names = {"5": "Цитадель", "4": "Адмирал", "3": "Флагман"}
-    buf = ""
-    for ver, kind, items in CHANGELOG_HISTORY:
-        vn = ver_names.get(ver.split(".")[0], "")
-        vlabel = f"{ver} «{vn}»" if vn else ver
-        body = premiumize("\n".join(items))
-        block = (f"{pe('star')} <b>{vlabel} — {kind}</b>\n"
-                 f"<blockquote expandable>{body}</blockquote>")
-        if buf and len(buf) + len(block) + 2 > 3500:
-            await update.message.reply_text(buf, parse_mode=ParseMode.HTML)
-            buf = ""
-        buf += ("\n\n" if buf else "") + block
-    if buf:
-        await update.message.reply_text(buf, parse_mode=ParseMode.HTML)
+        f"{pe('bulb')} Нашёл баг или есть идея — пиши {BOT_ADMIN}.")
+
+
+_DOCS_VER_NAMES = {"5": "Цитадель", "4": "Адмирал", "3": "Флагман"}
+
+
+def _docs_ver_label(ver):
+    vn = _DOCS_VER_NAMES.get(ver.split(".")[0], "")
+    return f"{ver} «{vn}»" if vn else ver
+
+
+def _docs_screen(i):
+    """Экран docs: шапка (остаётся всегда) + изменения одной версии."""
+    ver, kind, items = CHANGELOG_HISTORY[i]
+    body = premiumize("\n".join(items))
+    pos = f"{i + 1}/{len(CHANGELOG_HISTORY)}"
+    return (_docs_header() +
+            f"\n\n{pe('star')} <b>Изменения · {_docs_ver_label(ver)} — {kind}</b>  <i>({pos})</i>\n"
+            f"<blockquote expandable>{body}</blockquote>\n"
+            f"<i>Листай версии стрелками ниже ⤵️</i>")
+
+
+def _docs_arrows_kb(i):
+    row = []
+    if i < len(CHANGELOG_HISTORY) - 1:   # есть версия старее
+        row.append(InlineKeyboardButton(f"← {CHANGELOG_HISTORY[i + 1][0]}", callback_data=f"docs:v:{i + 1}"))
+    if i > 0:                            # есть версия новее
+        row.append(InlineKeyboardButton(f"{CHANGELOG_HISTORY[i - 1][0]} →", callback_data=f"docs:v:{i - 1}"))
+    return InlineKeyboardMarkup([row]) if row else None
+
+
+async def docs_info(update, context):
+    await update.message.reply_text(_docs_screen(0), reply_markup=_docs_arrows_kb(0),
+                                    parse_mode=ParseMode.HTML)
+
+
+async def on_docs_callback(update, context):
+    cq = update.callback_query
+    data = cq.data or ""
+    try:
+        i = 0
+        if data.startswith("docs:v:"):
+            i = int(data.split(":")[2])
+        i = max(0, min(len(CHANGELOG_HISTORY) - 1, i))
+        await cq.edit_message_text(_docs_screen(i), reply_markup=_docs_arrows_kb(i), parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    try:
+        await cq.answer()
+    except Exception:
+        pass
+
+
+def _day_top_text(chat_id, offset):
+    """Топ активности (по сообщениям) за день: offset 0=сегодня, 1=вчера и т.д."""
+    d = msk_now().date() - timedelta(days=offset)
+    rows = conn.execute(
+        "SELECT COALESCE(u.name,'?') AS name, s.cnt AS cnt FROM stats s "
+        "JOIN users u ON u.chat_id=s.chat_id AND u.user_id=s.user_id "
+        "WHERE s.chat_id=? AND s.day=? AND s.cnt>0 ORDER BY s.cnt DESC LIMIT 10",
+        (chat_id, d.isoformat())).fetchall()
+    when = "сегодня" if offset == 0 else ("вчера" if offset == 1 else _ru_date(d))
+    head = f"{pe('stats')} <b>Топ активности — {when}</b>\n<i>{d.strftime('%d.%m.%Y')} · по сообщениям</i>"
+    if not rows:
+        return head + "\n\n<i>За этот день активности не было.</i>"
+    medals = ["🥇", "🥈", "🥉"]
+    lines = [f"{(medals[i] if i < 3 else str(i + 1) + '.')} {esc(r['name'])} — <b>{r['cnt']}</b> сообщ."
+             for i, r in enumerate(rows)]
+    return head + "\n\n" + "\n".join(lines)
+
+
+def _day_top_kb(offset):
+    row = []
+    if offset < 6:   # глубже недели не уходим
+        row.append(InlineKeyboardButton("← раньше", callback_data=f"td:{offset + 1}"))
+    if offset > 0:   # вперёд — только до сегодня
+        row.append(InlineKeyboardButton("позже →", callback_data=f"td:{offset - 1}"))
+    return InlineKeyboardMarkup([row]) if row else None
+
+
+async def on_dailytop_callback(update, context):
+    cq = update.callback_query
+    try:
+        off = int((cq.data or "td:0").split(":")[1])
+        off = max(0, min(6, off))
+        await cq.edit_message_text(_day_top_text(cq.message.chat.id, off),
+                                   reply_markup=_day_top_kb(off), parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    try:
+        await cq.answer()
+    except Exception:
+        pass
 
 
 def _faq_text():
@@ -2822,6 +2911,11 @@ async def handle_triggers(update, context, text, low, parts):
         else:
             await show_profile(update, context, rt)
         return True
+    if first in ("топдень", "деньтоп", "topday", "daytop", "dailytop") or \
+       (first in ("top", "топ") and len(parts) > 1 and parts[1] in ("день", "дня", "сутки", "day", "daily")):
+        await update.message.reply_text(_day_top_text(update.effective_chat.id, 0),
+                                        reply_markup=_day_top_kb(0), parse_mode=ParseMode.HTML)
+        return True
     if first in ("top",):
         await show_top(update, context, parts[1:])
         return True
@@ -2961,6 +3055,70 @@ async def handle_triggers(update, context, text, low, parts):
                 f"{pe('catneutral')} За сегодня пока нечего показывать (никто не писал и ничего не происходило), "
                 f"либо я не смог написать тебе в личку — открой со мной личку и попробуй снова.",
                 parse_mode=ParseMode.HTML)
+        return True
+    if first in ("утро", "доброеутро", "morning"):
+        if not await require(update, context, ADMIN):
+            return True
+        await _send_greeting(context, update.effective_chat.id,
+                             build_morning_message(update.effective_chat.id), await _morning_gif())
+        return True
+    if first in ("ночь", "ночнойрежим", "night"):
+        if not await require(update, context, ADMIN):
+            return True
+        await _send_greeting(context, update.effective_chat.id, build_night_message(), await _night_gif())
+        return True
+    if first in ("добавитьгиф", "addgif", "гиф+"):
+        if not await require(update, context, ADMIN):
+            return True
+        kind = "morning" if (len(parts) > 1 and parts[1].lower() in ("утро", "morning", "m")) else \
+               ("night" if (len(parts) > 1 and parts[1].lower() in ("ночь", "night", "n")) else None)
+        if not kind:
+            await update.message.reply_text(
+                f"{pe('note')} Укажи, куда добавить: <code>.добавитьгиф утро</code> или <code>.добавитьгиф ночь</code> "
+                f"— и обязательно <b>ответом на гифку</b>.", parse_mode=ParseMode.HTML)
+            return True
+        rep = update.message.reply_to_message
+        anim = (rep.animation if rep else None) or (rep.document if rep else None)
+        if not anim or not getattr(anim, "file_id", None):
+            await update.message.reply_text(
+                f"{pe('cross')} Не вижу гифку. Сделай так: пришли гифку в чат, потом <b>ответь на неё</b> "
+                f"командой <code>.добавитьгиф {'утро' if kind=='morning' else 'ночь'}</code>.",
+                parse_mode=ParseMode.HTML)
+            return True
+        gif_add(kind, anim.file_id)
+        word = "утренних" if kind == "morning" else "ночных"
+        await update.message.reply_text(
+            f"{pe('check')} Гифка добавлена в копилку! Теперь {word} гифок: <b>{gif_count(kind)}</b>. "
+            f"Бот будет брать случайную в приветствии {pe('catlove')}", parse_mode=ParseMode.HTML)
+        return True
+    if first in ("гифы", "gifs", "гифки"):
+        if not await require(update, context, ADMIN):
+            return True
+        await update.message.reply_text(
+            f"{pe('folder')} <b>Копилка гифок</b>\n"
+            f"{pe('star')} Утро: <b>{gif_count('morning')}</b>\n"
+            f"{pe('lock')} Ночь: <b>{gif_count('night')}</b>\n"
+            f"<blockquote expandable>Добавить: пришли гифку и ответь на неё "
+            f"<code>.добавитьгиф утро</code> (или <code>ночь</code>).\n"
+            f"Очистить: <code>.очиститьгифы утро</code> / <code>ночь</code>.\n"
+            f"Гифки хранятся внутри Telegram и не теряются.</blockquote>",
+            parse_mode=ParseMode.HTML)
+        return True
+    if first in ("очиститьгифы", "cleargifs"):
+        if not await require(update, context, ADMIN):
+            return True
+        kind = "morning" if (len(parts) > 1 and parts[1].lower() in ("утро", "morning", "m")) else \
+               ("night" if (len(parts) > 1 and parts[1].lower() in ("ночь", "night", "n")) else None)
+        if not kind:
+            await update.message.reply_text(
+                f"{pe('note')} Уточни: <code>.очиститьгифы утро</code> или <code>.очиститьгифы ночь</code>.",
+                parse_mode=ParseMode.HTML)
+            return True
+        n = gif_count(kind)
+        gif_clear(kind)
+        await update.message.reply_text(
+            f"{pe('check')} Копилка {'утренних' if kind=='morning' else 'ночных'} гифок очищена (было {n}).",
+            parse_mode=ParseMode.HTML)
         return True
     if first in ("finish", "endgw") and active_giveaways.get(update.effective_chat.id):
         await end_giveaway(update, context); return True
@@ -3867,16 +4025,15 @@ def build_daily_report_csv(chat_id, day):
     return buf.getvalue(), summary
 
 
-def build_daily_report_xlsx(chat_id, day):
-    """Единый официальный Excel-отчёт за день: сводка, активность, встроенные диаграммы
-    (активность за 7 дней + доли сообщений) и журнал (модерация, заказы).
-    Возвращает (bytes, summary) или (None, None). Требует openpyxl — если его нет, вернёт None,
-    и сработает запасной CSV-вариант."""
+def build_daily_report_xlsx(chat_id, day, charts=None):
+    """Единый официальный Excel-отчёт за день: сводка, активность, диаграммы и журнал.
+    charts — список (title, png_bytes): диаграммы встраиваются КАРТИНКАМИ (видны на любом
+    устройстве). Возвращает (bytes, summary) или (None, None). Требует openpyxl — если его нет,
+    вернёт None, и сработает запасной CSV-вариант."""
     try:
         import io as _io
         from openpyxl import Workbook
-        from openpyxl.styles import Font, PatternFill, Alignment
-        from openpyxl.chart import BarChart, PieChart, Reference
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     except Exception:
         return None, None
     rows = conn.execute(
@@ -3898,101 +4055,142 @@ def build_daily_report_xlsx(chat_id, day):
     if not active and not mod and not orders:
         return None, None
     total_msgs = sum(r["msgs"] for r in active)
-    total_lp = sum(r["lpd"] for r in active)
+    total_lp = round(sum(r["lpd"] for r in active), 2)
 
     NAVY, BLUE, LIGHT, RED = "1F3864", "2E5496", "D9E1F2", "C00000"
     white_bold = Font(bold=True, color="FFFFFF")
+    thin = Side(style="thin", color="BFBFBF")
+    box = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center")
+    left = Alignment(horizontal="left", vertical="center")
 
     def hdr(cell, text, fill=BLUE):
         cell.value = text
         cell.font = white_bold
         cell.fill = PatternFill("solid", fgColor=fill)
-        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.alignment = center
+        cell.border = box
 
     wb = Workbook()
     ws = wb.active
     ws.title = "Отчёт"
     ws.sheet_view.showGridLines = False
-    for i, wdt in enumerate([26, 16, 12, 12, 12, 12], 1):
+    for i, wdt in enumerate([30, 22, 14, 15, 14, 13], 1):
         ws.column_dimensions[chr(64 + i)].width = wdt
     ws.merge_cells("A1:F1")
     c = ws["A1"]
     c.value = f"{CLAN_NAME} — ОТЧЁТ ПО ЧАТУ"
     c.font = Font(bold=True, size=18, color="FFFFFF")
     c.fill = PatternFill("solid", fgColor=NAVY)
-    c.alignment = Alignment(horizontal="center", vertical="center")
-    ws.row_dimensions[1].height = 30
+    c.alignment = center
+    ws.row_dimensions[1].height = 34
     ws.merge_cells("A2:F2")
     c = ws["A2"]
     c.value = f"за {_fmt_day_human(day)}   •   КОНФИДЕНЦИАЛЬНО — только для администрации"
     c.font = Font(bold=True, italic=True, color=RED)
-    c.alignment = Alignment(horizontal="center")
+    c.alignment = center
+    ws.row_dimensions[2].height = 20
     ws["A4"].value = "СВОДКА ЗА ДЕНЬ"
     ws["A4"].font = Font(bold=True, size=13, color=NAVY)
-    summ = [("Сообщений за день", total_msgs), ("Активных участников", len(active)),
-            ("Изменение LP", f"+{total_lp}" if total_lp > 0 else total_lp),
-            ("Действий модерации", len(mod)), ("Заказов в магазине", len(orders)),
-            ("Самый активный", active[0]["name"] if active else "—")]
-    for i, (k, v) in enumerate(summ):
+    summ = [("Сообщений за день", total_msgs, None), ("Активных участников", len(active), None),
+            ("Изменение LP за день", total_lp, "+0.00;-0.00;0"),
+            ("Действий модерации", len(mod), None), ("Заказов в магазине", len(orders), None),
+            ("Самый активный", active[0]["name"] if active else "—", None)]
+    for i, (k, v, fmt) in enumerate(summ):
         ws.cell(5 + i, 1, k).font = Font(bold=True)
-        ws.cell(5 + i, 2, v)
+        cell = ws.cell(5 + i, 2, v)
+        if fmt:
+            cell.number_format = fmt
     tr = 5 + len(summ) + 1
     ws.cell(tr, 1).value = "АКТИВНОСТЬ УЧАСТНИКОВ"
     ws.cell(tr, 1).font = Font(bold=True, size=13, color=NAVY)
     tr += 1
     for j, h in enumerate(["Имя", "Ник", "Сообщений", "LP за день", "Баланс LP", "Репутация"], 1):
         hdr(ws.cell(tr, j), h)
+    ws.row_dimensions[tr].height = 18
     for i, r in enumerate(active):
         rr = tr + 1 + i
         uname = ("@" + r["uname"]) if r["uname"] else ""
-        ws.cell(rr, 1, r["name"]); ws.cell(rr, 2, uname); ws.cell(rr, 3, r["msgs"])
-        ws.cell(rr, 4, (f"+{r['lpd']}" if r["lpd"] > 0 else r["lpd"]))
-        ws.cell(rr, 5, r["lp"]); ws.cell(rr, 6, r["rep"])
-        if i % 2 == 0:
-            for j in range(1, 7):
-                ws.cell(rr, j).fill = PatternFill("solid", fgColor=LIGHT)
+        vals = [r["name"], uname, r["msgs"], round(r["lpd"], 2), round(r["lp"], 2), r["rep"]]
+        for j, v in enumerate(vals, 1):
+            cell = ws.cell(rr, j, v)
+            cell.border = box
+            cell.alignment = left if j <= 2 else center
+            if i % 2 == 0:
+                cell.fill = PatternFill("solid", fgColor=LIGHT)
+        ws.cell(rr, 4).number_format = "+0.00;-0.00;0"
+        ws.cell(rr, 5).number_format = "0.##"
+    table_end = tr + len(active)
 
-    wd = wb.create_sheet("Графики")
-    wd.sheet_view.showGridLines = False
-    wd.column_dimensions["A"].width = 16
-    wd.column_dimensions["B"].width = 14
-    try:
-        base = datetime.fromisoformat(day).date()
-    except Exception:
-        base = msk_now().date()
-    week = []
-    for i in range(6, -1, -1):
-        d = (base - timedelta(days=i)).isoformat()
-        cc = conn.execute("SELECT COALESCE(SUM(cnt),0) AS c FROM stats WHERE chat_id=? AND day=?",
-                          (chat_id, d)).fetchone()["c"]
-        week.append((datetime.fromisoformat(d).strftime("%d.%m"), int(cc)))
-    wd.cell(2, 1, "День"); wd.cell(2, 2, "Сообщений")
-    for i, (lbl, val) in enumerate(week):
-        wd.cell(3 + i, 1, lbl); wd.cell(3 + i, 2, val)
-    bar = BarChart(); bar.type = "col"; bar.title = "Активность за 7 дней"; bar.legend = None
-    bar.add_data(Reference(wd, min_col=2, min_row=2, max_row=2 + len(week)), titles_from_data=True)
-    bar.set_categories(Reference(wd, min_col=1, min_row=3, max_row=2 + len(week)))
-    bar.height = 8; bar.width = 18
-    wd.add_chart(bar, "D2")
-    sr = 3 + len(week) + 2
-    top = [r for r in active if r["msgs"] > 0][:6]
-    shares = [(r["name"], r["msgs"]) for r in top]
-    others = total_msgs - sum(v for _, v in shares)
-    if others > 0:
-        shares.append(("Остальные", others))
-    if shares:
-        wd.cell(sr, 1, "Участник"); wd.cell(sr, 2, "Сообщений")
-        for i, (nm, vv) in enumerate(shares):
-            wd.cell(sr + 1 + i, 1, nm); wd.cell(sr + 1 + i, 2, vv)
-        pie = PieChart(); pie.title = "Доли сообщений за день"
-        pie.add_data(Reference(wd, min_col=2, min_row=sr, max_row=sr + len(shares)), titles_from_data=True)
-        pie.set_categories(Reference(wd, min_col=1, min_row=sr + 1, max_row=sr + len(shares)))
-        pie.height = 8; pie.width = 18
-        wd.add_chart(pie, "D" + str(sr))
+    # ── Диаграммы: картинками (видны везде), иначе — родные диаграммы Excel ──
+    embedded = False
+    if charts:
+        try:
+            import PIL  # noqa: F401  — openpyxl рисует картинки через Pillow
+            from openpyxl.drawing.image import Image as XLImage
+            arow = table_end + 3
+            ws.cell(arow, 1).value = "ДИАГРАММЫ"
+            ws.cell(arow, 1).font = Font(bold=True, size=13, color=NAVY)
+            arow += 1
+            for title, png in charts:
+                if not png:
+                    continue
+                ws.cell(arow, 1).value = title
+                ws.cell(arow, 1).font = Font(bold=True, color=NAVY)
+                im = XLImage(_io.BytesIO(png))
+                if im.width:
+                    k = 600.0 / im.width
+                    im.width = int(im.width * k)
+                    im.height = int(im.height * k)
+                ws.add_image(im, f"A{arow + 1}")
+                arow += int(im.height / 19) + 3
+            embedded = True
+        except Exception as e:
+            print(f"[REPORT] не удалось встроить графики-картинки: {e}", flush=True)
+            embedded = False
+    if not embedded:
+        from openpyxl.chart import BarChart, PieChart, Reference
+        wd = wb.create_sheet("Графики")
+        wd.sheet_view.showGridLines = False
+        wd.column_dimensions["A"].width = 16
+        wd.column_dimensions["B"].width = 14
+        try:
+            base = datetime.fromisoformat(day).date()
+        except Exception:
+            base = msk_now().date()
+        week = []
+        for i in range(6, -1, -1):
+            d = (base - timedelta(days=i)).isoformat()
+            cc = conn.execute("SELECT COALESCE(SUM(cnt),0) AS c FROM stats WHERE chat_id=? AND day=?",
+                              (chat_id, d)).fetchone()["c"]
+            week.append((datetime.fromisoformat(d).strftime("%d.%m"), int(cc)))
+        wd.cell(2, 1, "День"); wd.cell(2, 2, "Сообщений")
+        for i, (lbl, val) in enumerate(week):
+            wd.cell(3 + i, 1, lbl); wd.cell(3 + i, 2, val)
+        bar = BarChart(); bar.type = "col"; bar.title = "Активность за 7 дней"; bar.legend = None
+        bar.add_data(Reference(wd, min_col=2, min_row=2, max_row=2 + len(week)), titles_from_data=True)
+        bar.set_categories(Reference(wd, min_col=1, min_row=3, max_row=2 + len(week)))
+        bar.height = 8; bar.width = 18
+        wd.add_chart(bar, "D2")
+        sr = 3 + len(week) + 2
+        top = [r for r in active if r["msgs"] > 0][:6]
+        shares = [(r["name"], r["msgs"]) for r in top]
+        others = total_msgs - sum(v for _, v in shares)
+        if others > 0:
+            shares.append(("Остальные", others))
+        if shares:
+            wd.cell(sr, 1, "Участник"); wd.cell(sr, 2, "Сообщений")
+            for i, (nm, vv) in enumerate(shares):
+                wd.cell(sr + 1 + i, 1, nm); wd.cell(sr + 1 + i, 2, vv)
+            pie = PieChart(); pie.title = "Доли сообщений за день"
+            pie.add_data(Reference(wd, min_col=2, min_row=sr, max_row=sr + len(shares)), titles_from_data=True)
+            pie.set_categories(Reference(wd, min_col=1, min_row=sr + 1, max_row=sr + len(shares)))
+            pie.height = 8; pie.width = 18
+            wd.add_chart(pie, "D" + str(sr))
 
     wj = wb.create_sheet("Журнал")
     wj.sheet_view.showGridLines = False
-    for col, wdt in (("A", 10), ("B", 22), ("C", 22), ("D", 16), ("E", 30)):
+    for col, wdt in (("A", 10), ("B", 24), ("C", 24), ("D", 18), ("E", 34)):
         wj.column_dimensions[col].width = wdt
     wj["A1"].value = "МОДЕРАЦИЯ ЗА ДЕНЬ"
     wj["A1"].font = Font(bold=True, size=13, color=NAVY)
@@ -4001,8 +4199,8 @@ def build_daily_report_xlsx(chat_id, day):
             hdr(wj.cell(2, j), h)
         for i, m in enumerate(mod):
             rr = 3 + i
-            wj.cell(rr, 1, _hhmm(m["ts"])); wj.cell(rr, 2, m["adm"]); wj.cell(rr, 3, m["tgt"])
-            wj.cell(rr, 4, m["act"]); wj.cell(rr, 5, m["rsn"])
+            for j, v in enumerate([_hhmm(m["ts"]), m["adm"], m["tgt"], m["act"], m["rsn"]], 1):
+                wj.cell(rr, j, v).border = box
         orow = 3 + len(mod) + 2
     else:
         wj.cell(2, 1, "нарушений и наказаний не было")
@@ -4014,8 +4212,8 @@ def build_daily_report_xlsx(chat_id, day):
             hdr(wj.cell(orow + 1, j), h)
         for i, o in enumerate(orders):
             rr = orow + 2 + i
-            wj.cell(rr, 1, _hhmm(o["ts"])); wj.cell(rr, 2, o["name"]); wj.cell(rr, 3, o["item"])
-            wj.cell(rr, 4, o["price"]); wj.cell(rr, 5, o["st"])
+            for j, v in enumerate([_hhmm(o["ts"]), o["name"], o["item"], o["price"], o["st"]], 1):
+                wj.cell(rr, j, v).border = box
     else:
         wj.cell(orow + 1, 1, "заказов не было")
 
@@ -4032,7 +4230,18 @@ async def send_daily_report(context, chat_id, day, recipient=None):
     recipient = recipient or LEADER_ID
     try:
         import io as _io
-        xlsx, s = build_daily_report_xlsx(chat_id, day)
+        # Готовим диаграммы картинками — они встроятся в Excel и видны на любом устройстве.
+        charts = []
+        cfg_a, _ = _activity_chart_config(chat_id, 7)
+        png_a = await _quickchart_png(cfg_a, 760, 380)
+        if png_a:
+            charts.append(("Активность за 7 дней", png_a))
+        cfg_s, _ = _share_chart_config(chat_id, day)
+        if cfg_s:
+            png_s = await _quickchart_png(cfg_s, 760, 400)
+            if png_s:
+                charts.append(("Доли сообщений за день", png_s))
+        xlsx, s = build_daily_report_xlsx(chat_id, day, charts=charts)
         if xlsx:
             data = _io.BytesIO(xlsx)
             data.name = f"linkor_report_{day}.xlsx"
@@ -4069,111 +4278,119 @@ async def send_daily_report(context, chat_id, day, recipient=None):
         return False
 
 
-async def send_activity_chart(context, chat_id, recipient, days=7):
-    """График активности за последние N дней (сообщений в день) + сравнение с вчера.
-    Рендерится сервисом QuickChart по httpx — без доп. библиотек на сервере.
-    Возвращает True, если график отправлен."""
+def _activity_chart_config(chat_id, days=7):
+    """Строит конфиг QuickChart для графика активности за N дней. Возвращает (config, caption)."""
+    base = msk_now().date()
+    labels, values = [], []
+    for i in range(days - 1, -1, -1):
+        d = (base - timedelta(days=i)).isoformat()
+        c = conn.execute("SELECT COALESCE(SUM(cnt),0) AS c FROM stats WHERE chat_id=? AND day=?",
+                         (chat_id, d)).fetchone()["c"]
+        labels.append(datetime.fromisoformat(d).strftime("%d.%m"))
+        values.append(int(c))
+    colors = ["#4e79a7"] * len(values)
+    if colors:
+        colors[-1] = "#e15759"   # сегодня — выделяем красным
+    config = {
+        "type": "bar",
+        "data": {"labels": labels,
+                 "datasets": [{"label": "Сообщений", "data": values, "backgroundColor": colors}]},
+        "options": {
+            "title": {"display": True, "text": f"Активность {CLAN_NAME} — сообщений в день", "fontSize": 16},
+            "legend": {"display": False},
+            "scales": {"yAxes": [{"ticks": {"beginAtZero": True}}]},
+        },
+    }
+    today_c = values[-1] if values else 0
+    yest_c = values[-2] if len(values) >= 2 else 0
+    if yest_c > 0:
+        pct = round((today_c - yest_c) / yest_c * 100)
+        trend = f"{pe('growth')} +{pct}% к вчера" if today_c >= yest_c else f"📉 {pct}% к вчера"
+    else:
+        trend = "за вчера данных нет"
+    cap = (f"{pe('growth')} <b>Активность {CLAN_NAME} за {days} дн.</b>\n"
+           f"Сегодня: <b>{today_c}</b> сообщ. · вчера: <b>{yest_c}</b> · {trend}\n"
+           f"<i>Следи за трендом: проседает актив — пора расшевелить клан.</i>")
+    return config, cap
+
+
+def _share_chart_config(chat_id, day=None, top_n=6):
+    """Строит конфиг QuickChart для круговой диаграммы долей. Возвращает (config, caption) или (None, None)."""
+    day = day or today_str()
+    rows = conn.execute(
+        "SELECT COALESCE(u.name,'?') AS name, s.cnt AS cnt FROM stats s "
+        "JOIN users u ON u.chat_id=s.chat_id AND u.user_id=s.user_id "
+        "WHERE s.chat_id=? AND s.day=? AND s.cnt>0 ORDER BY s.cnt DESC",
+        (chat_id, day)).fetchall()
+    total = sum(r["cnt"] for r in rows)
+    if total <= 0:
+        return None, None
+    top = rows[:top_n]
+    labels = [r["name"] for r in top]
+    values = [r["cnt"] for r in top]
+    others = total - sum(values)
+    if others > 0:
+        labels.append("Остальные")
+        values.append(others)
+    palette = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f",
+               "#edc948", "#b07aa1", "#9c755f", "#bab0ac"]
+    colors = [palette[i % len(palette)] for i in range(len(values))]
+    config = {
+        "type": "doughnut",
+        "data": {"labels": labels, "datasets": [{"data": values, "backgroundColor": colors}]},
+        "options": {
+            "title": {"display": True, "text": f"Доли сообщений за {_fmt_day_human(day)} — {CLAN_NAME}",
+                      "fontSize": 15},
+            "legend": {"position": "right"},
+        },
+    }
+    top1_pct = round(values[0] / total * 100)
+    topn_pct = round(sum(r["cnt"] for r in top) / total * 100)
+    cap = (f"{pe('stats')} <b>Доли сообщений за {_fmt_day_human(day)}</b>\n"
+           f"Топ-1 — <b>{esc(labels[0])}</b> ({top1_pct}%) · топ-{len(top)} дают <b>{topn_pct}%</b> всего чата.\n"
+           f"<i>Если пара человек тянет почти всё — стоит вовлечь остальных.</i>")
+    return config, cap
+
+
+async def _quickchart_png(config, width=640, height=360):
+    """Запрашивает у QuickChart картинку (PNG) по конфигу. Возвращает bytes или None."""
     try:
-        import io as _io
-        labels, values = [], []
-        base = msk_now().date()
-        for i in range(days - 1, -1, -1):
-            d = (base - timedelta(days=i)).isoformat()
-            c = conn.execute("SELECT COALESCE(SUM(cnt),0) AS c FROM stats WHERE chat_id=? AND day=?",
-                             (chat_id, d)).fetchone()["c"]
-            labels.append(datetime.fromisoformat(d).strftime("%d.%m"))
-            values.append(int(c))
-        colors = ["#4e79a7"] * len(values)
-        if colors:
-            colors[-1] = "#e15759"   # сегодня — выделяем красным
-        config = {
-            "type": "bar",
-            "data": {"labels": labels,
-                     "datasets": [{"label": "Сообщений", "data": values, "backgroundColor": colors}]},
-            "options": {
-                "title": {"display": True, "text": f"Активность {CLAN_NAME} — сообщений в день", "fontSize": 16},
-                "legend": {"display": False},
-                "scales": {"yAxes": [{"ticks": {"beginAtZero": True}}]},
-            },
-        }
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.post("https://quickchart.io/chart",
-                                  json={"width": 640, "height": 360, "format": "png",
+                                  json={"width": width, "height": height, "format": "png",
                                         "backgroundColor": "white", "chart": config})
-        if r.status_code != 200 or not r.content:
-            print(f"[CHART] QuickChart вернул {r.status_code}", flush=True)
-            return False
-        img = _io.BytesIO(r.content)
-        img.name = "activity.png"
-        today_c = values[-1] if values else 0
-        yest_c = values[-2] if len(values) >= 2 else 0
-        if yest_c > 0:
-            pct = round((today_c - yest_c) / yest_c * 100)
-            trend = f"{pe('growth')} +{pct}% к вчера" if today_c >= yest_c else f"📉 {pct}% к вчера"
-        else:
-            trend = "за вчера данных нет"
-        cap = (f"{pe('growth')} <b>Активность {CLAN_NAME} за {days} дн.</b>\n"
-               f"Сегодня: <b>{today_c}</b> сообщ. · вчера: <b>{yest_c}</b> · {trend}\n"
-               f"<i>Следи за трендом: проседает актив — пора расшевелить клан.</i>")
-        await context.bot.send_photo(recipient, photo=img, caption=cap, parse_mode=ParseMode.HTML)
-        return True
+        if r.status_code == 200 and r.content:
+            return r.content
+        print(f"[CHART] QuickChart вернул {r.status_code}", flush=True)
     except Exception as e:
-        print(f"[CHART] не удалось отправить график: {e}", flush=True)
+        print(f"[CHART] QuickChart ошибка: {e}", flush=True)
+    return None
+
+
+async def send_activity_chart(context, chat_id, recipient, days=7):
+    """Отправляет график активности картинкой (запасной путь, когда нет Excel)."""
+    config, cap = _activity_chart_config(chat_id, days)
+    png = await _quickchart_png(config, 640, 360)
+    if not png:
         return False
+    import io as _io
+    img = _io.BytesIO(png); img.name = "activity.png"
+    await context.bot.send_photo(recipient, photo=img, caption=cap, parse_mode=ParseMode.HTML)
+    return True
 
 
 async def send_share_chart(context, chat_id, recipient, day=None, top_n=6):
-    """Круговая диаграмма долей сообщений за день: топ-N участников + «Остальные».
-    Рендер через QuickChart (без доп. библиотек). Возвращает True, если отправлена."""
-    try:
-        import io as _io
-        day = day or today_str()
-        rows = conn.execute(
-            "SELECT COALESCE(u.name,'?') AS name, s.cnt AS cnt FROM stats s "
-            "JOIN users u ON u.chat_id=s.chat_id AND u.user_id=s.user_id "
-            "WHERE s.chat_id=? AND s.day=? AND s.cnt>0 ORDER BY s.cnt DESC",
-            (chat_id, day)).fetchall()
-        total = sum(r["cnt"] for r in rows)
-        if total <= 0:
-            return False
-        top = rows[:top_n]
-        labels = [r["name"] for r in top]
-        values = [r["cnt"] for r in top]
-        others = total - sum(values)
-        if others > 0:
-            labels.append("Остальные")
-            values.append(others)
-        palette = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f",
-                   "#edc948", "#b07aa1", "#9c755f", "#bab0ac"]
-        colors = [palette[i % len(palette)] for i in range(len(values))]
-        config = {
-            "type": "doughnut",
-            "data": {"labels": labels, "datasets": [{"data": values, "backgroundColor": colors}]},
-            "options": {
-                "title": {"display": True, "text": f"Доли сообщений за {_fmt_day_human(day)} — {CLAN_NAME}",
-                          "fontSize": 15},
-                "legend": {"position": "right"},
-            },
-        }
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.post("https://quickchart.io/chart",
-                                  json={"width": 640, "height": 380, "format": "png",
-                                        "backgroundColor": "white", "chart": config})
-        if r.status_code != 200 or not r.content:
-            print(f"[CHART] QuickChart (доли) вернул {r.status_code}", flush=True)
-            return False
-        img = _io.BytesIO(r.content)
-        img.name = "shares.png"
-        top1_pct = round(values[0] / total * 100)
-        topn_pct = round(sum(r["cnt"] for r in top) / total * 100)
-        cap = (f"{pe('stats')} <b>Доли сообщений за {_fmt_day_human(day)}</b>\n"
-               f"Топ-1 — <b>{esc(labels[0])}</b> ({top1_pct}%) · топ-{len(top)} дают <b>{topn_pct}%</b> всего чата.\n"
-               f"<i>Если пара человек тянет почти всё — стоит вовлечь остальных.</i>")
-        await context.bot.send_photo(recipient, photo=img, caption=cap, parse_mode=ParseMode.HTML)
-        return True
-    except Exception as e:
-        print(f"[CHART] не удалось отправить диаграмму долей: {e}", flush=True)
+    """Отправляет диаграмму долей картинкой (запасной путь, когда нет Excel)."""
+    config, cap = _share_chart_config(chat_id, day, top_n)
+    if not config:
         return False
+    png = await _quickchart_png(config, 640, 380)
+    if not png:
+        return False
+    import io as _io
+    img = _io.BytesIO(png); img.name = "shares.png"
+    await context.bot.send_photo(recipient, photo=img, caption=cap, parse_mode=ParseMode.HTML)
+    return True
 
 
 async def maybe_daily_report(context, chat_id):
@@ -4313,6 +4530,11 @@ async def counter(update, context):
     # Ежедневный отчёт владельцу за прошедший день — фоном
     try:
         await maybe_daily_report(context, chat_id)
+    except Exception:
+        pass
+    # Поздравить первого, кто написал сегодня утром — фоном
+    try:
+        await maybe_first_writer(update, context, chat_id, user)
     except Exception:
         pass
     # Тег-гейт: новичок без привязанного тега получает предупреждения (3 дня → исключение)
@@ -4544,7 +4766,9 @@ def _help_section(key):
                 "<code>.отвязать</code> (ответом/@/ID) — снять чужой игровой тег\n\n"
                 "<b>Владелец</b> (в чате и в личке): <code>.modlog</code> · <code>.analytics</code> · <code>.backup</code> · "
                 "<code>.bonusall 150</code> · <code>.checknorms</code> · <code>.snapshotnorms</code> · "
-                "<code>.отчет</code> (официальный Excel-отчёт по чату за день: сводка, активность, графики, журнал — в личку)\n\n"
+                "<code>.отчет</code> (официальный Excel-отчёт по чату за день: сводка, активность, графики, журнал — в личку)\n"
+                "<code>.утро</code> / <code>.ночь</code> — показать приветствие сейчас (для проверки; обычно бот шлёт сам в 8:00 и 22:00 МСК)\n"
+                "<code>.добавитьгиф утро/ночь</code> (ответом на гифку) · <code>.гифы</code> · <code>.очиститьгифы утро/ночь</code> — копилка гифок для приветствий\n\n"
                 "<b>Опрос:</b> <code>.poll Вопрос? | вар1 | вар2</code>\n"
                 "<b>Нормы</b> (с 22 июня): авто по Пн/Вс · <code>.отпуск @юзер 1–30</code>\n"
                 "<b>Награды</b> (ответом): <code>.норма ранг</code> · <code>.норма кубки</code></blockquote>")
@@ -4731,6 +4955,235 @@ async def on_unknown_callback(update, context):
         pass
 
 
+# ─────────────────────── Авто-приветствия (утро / ночь) ───────────────────────
+# Что можно настроить: время по Москве и ссылки на гифки (оставь пустыми — будет только текст).
+GREETINGS_ENABLED = True
+MORNING_HOUR = 8        # час утреннего приветствия (МСК)
+NIGHT_HOUR = 22         # час ночного режима (МСК)
+MORNING_GIF = ""        # ссылка на гифку для утра (например, с котятами). Пусто — без гифки.
+NIGHT_GIF = ""          # ссылка на гифку для ночи. Пусто — без гифки.
+AUTO_CAT_GIFS = True    # утром бот сам берёт свежую гифку с котиком (The Cat API) — искать не нужно.
+CAT_API_KEY = ""        # необязательный бесплатный ключ thecatapi.com (для стабильности). Пусто — тоже работает.
+NIGHT_AUTO_GIFS = True  # ночью бот сам берёт спокойную тематическую гифку (нужен ключ Giphy ниже).
+GIPHY_API_KEY = ""      # бесплатный ключ с developers.giphy.com (для ночных авто-гифок). Пусто — берётся копилка.
+NIGHT_GIF_TAG = "sleepy cat"  # тема ночной гифки (например: sleepy cat, good night, calm night).
+
+# Наборы фраз: бот берёт по дню (каждый день другая, со временем повторяются — без шаблонности).
+_MORNING_LINES = [
+    "Новый день — новые кубки. Погнали 💪",
+    "Заряжаемся на победы и хорошее настроение ⚡",
+    "Пусть сегодня залетают только лёгкие катки 🎮",
+    "Отличный день, чтобы пообщаться и накидать трофеев 🏆",
+    "Врываемся в новый день, бойцы! 🚀",
+    "Пусть день будет добрым, а катки — победными 🔥",
+    "Сделаем этот день огненным 😎",
+]
+_NIGHT_LINES = [
+    "Час тишины и отдыха — самое время сбавить обороты 😴",
+    "Чат потихоньку засыпает. Сладких снов 🌌",
+    "Отдыхаем и набираемся сил перед новыми катками 💤",
+    "Спокойствие и уют — добрых снов всему клану 🌙",
+    "Тихий час клана: отдыхаем до утра ✨",
+]
+_MORNING_WEEKDAY = {
+    0: ["Понедельник — врываемся в новую неделю! 🚀", "Новая неделя — новые победы, погнали 💪"],
+    1: ["Вторник в деле — набираем обороты ⚡", "Вторник: погнали фармить кубки 🏆"],
+    2: ["Серединка недели — держим темп 🔥", "Среда — самое время размяться в катках 🎮"],
+    3: ["Четверг — финишная прямая близко 💪", "Четверг: ещё чуть-чуть до выходных ⚡"],
+    4: ["Пятница! Выходные на горизонте 🎉", "Пятница — врубаем хорошее настроение 😎"],
+    5: ["Суббота — отдыхаем и катаем в удовольствие 🎮", "Выходной режим: больше катки, больше веселья 🔥"],
+    6: ["Воскресенье — заряжаемся перед новой неделей ☀️", "Спокойное воскресенье — катаем в кайф 😌"],
+}
+_RU_WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+_RU_MONTHS = ["", "января", "февраля", "марта", "апреля", "мая", "июня",
+              "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+
+# Что уже сделано сегодня (чтобы не повторяться в течение суток).
+_greet_state = {"first_writer_day": None}
+
+
+def _ru_date(dt):
+    return f"{_RU_WEEKDAYS[dt.weekday()]}, {dt.day} {_RU_MONTHS[dt.month]}"
+
+
+def _daily_pick(pool, salt=0):
+    if not pool:
+        return ""
+    return pool[(msk_now().date().toordinal() + salt) % len(pool)]
+
+
+def _morning_digest(chat_id):
+    """Короткий итог вчерашнего дня для утреннего приветствия (берётся из данных бота)."""
+    y = (msk_now().date() - timedelta(days=1)).isoformat()
+    bits = []
+    row = conn.execute(
+        "SELECT COALESCE(u.name,'?') AS name, s.cnt AS cnt FROM stats s "
+        "JOIN users u ON u.chat_id=s.chat_id AND u.user_id=s.user_id "
+        "WHERE s.chat_id=? AND s.day=? AND s.cnt>0 ORDER BY s.cnt DESC LIMIT 1",
+        (chat_id, y)).fetchone()
+    if row:
+        bits.append(f"вчера в топе — <b>{esc(row['name'])}</b> ({row['cnt']} сообщ.)")
+    lp = conn.execute(
+        "SELECT COALESCE(u.name,'?') AS name, SUM(l.delta) AS d FROM lp_log l "
+        "JOIN users u ON u.chat_id=l.chat_id AND u.user_id=l.user_id "
+        "WHERE l.chat_id=? AND l.day=? GROUP BY l.user_id HAVING d>0 ORDER BY d DESC LIMIT 1",
+        (chat_id, y)).fetchone()
+    if lp and (not row or lp["name"] != row["name"]):
+        bits.append(f"больше всех LP заработал <b>{esc(lp['name'])}</b>")
+    return bits
+
+
+def build_morning_message(chat_id):
+    now = msk_now()
+    line = _daily_pick(_MORNING_WEEKDAY.get(now.weekday(), _MORNING_LINES))
+    text = (f"{pe('star')} <b>ДОБРОЕ УТРО, {CLAN_NAME}!</b>\n"
+            f"<blockquote>Сегодня {_ru_date(now)}. {line}")
+    digest = _morning_digest(chat_id)
+    if digest:
+        text += f"\n{pe('stats')} " + "; ".join(digest) + "."
+    text += "</blockquote>"
+    return text
+
+
+def build_night_message():
+    return (f"{pe('lock')} <b>{CLAN_NAME} уходит в ночной режим</b>\n"
+            f"<blockquote>{_daily_pick(_NIGHT_LINES, salt=3)}\nДо утра, бойцы.</blockquote>")
+
+
+def gif_add(kind, file_id):
+    conn.execute("INSERT INTO greeting_gifs(kind, file_id, ts) VALUES(?,?,?)",
+                 (kind, file_id, msk_now().isoformat()))
+    conn.commit()
+
+
+def gif_count(kind):
+    return conn.execute("SELECT COUNT(*) AS c FROM greeting_gifs WHERE kind=?", (kind,)).fetchone()["c"]
+
+
+def gif_clear(kind):
+    conn.execute("DELETE FROM greeting_gifs WHERE kind=?", (kind,))
+    conn.commit()
+
+
+def gif_random(kind):
+    """Случайная гифка из копилки данного типа (или '' если копилка пуста)."""
+    row = conn.execute("SELECT file_id FROM greeting_gifs WHERE kind=? ORDER BY RANDOM() LIMIT 1",
+                       (kind,)).fetchone()
+    return row["file_id"] if row else ""
+
+
+def _greeting_gif(kind):
+    """Гифка для приветствия: сначала из копилки (надёжно, не теряется), иначе из настройки-ссылки."""
+    return gif_random(kind) or (MORNING_GIF if kind == "morning" else NIGHT_GIF)
+
+
+async def _fetch_cat_gif():
+    """Берёт случайную гифку с котиком через бесплатный The Cat API (без ключа тоже работает)."""
+    try:
+        headers = {"x-api-key": CAT_API_KEY} if CAT_API_KEY else {}
+        async with httpx.AsyncClient(timeout=12) as c:
+            r = await c.get("https://api.thecatapi.com/v1/images/search?mime_types=gif&limit=1",
+                            headers=headers)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, list) and data and data[0].get("url"):
+                return data[0]["url"]
+    except Exception as e:
+        print(f"[GREET] не удалось получить кото-гифку: {e}", flush=True)
+    return ""
+
+
+async def _morning_gif():
+    """Утренняя гифка: сперва авто-котик (если включено), иначе копилка/ссылка."""
+    if AUTO_CAT_GIFS:
+        g = await _fetch_cat_gif()
+        if g:
+            return g
+    return _greeting_gif("morning")
+
+
+async def _fetch_night_gif():
+    """Берёт случайную спокойную гифку по теме через Giphy (нужен бесплатный ключ)."""
+    if not GIPHY_API_KEY:
+        return ""
+    try:
+        import urllib.parse
+        tag = urllib.parse.quote(NIGHT_GIF_TAG or "good night")
+        url = f"https://api.giphy.com/v1/gifs/random?api_key={GIPHY_API_KEY}&tag={tag}&rating=g"
+        async with httpx.AsyncClient(timeout=12) as c:
+            r = await c.get(url)
+        if r.status_code == 200:
+            d = (r.json() or {}).get("data") or {}
+            u = (((d.get("images") or {}).get("original") or {}).get("url")) or d.get("image_original_url")
+            if u:
+                return u
+    except Exception as e:
+        print(f"[GREET] не удалось получить ночную гифку (Giphy): {e}", flush=True)
+    return ""
+
+
+async def _night_gif():
+    """Ночная гифка: сперва авто-тема (если включено и есть ключ), иначе копилка/ссылка."""
+    if NIGHT_AUTO_GIFS:
+        g = await _fetch_night_gif()
+        if g:
+            return g
+    return _greeting_gif("night")
+
+
+async def _send_greeting(context, chat_id, text, gif):
+    """Шлёт приветствие: с гифкой (если задана ссылка), иначе просто текст.
+    Если гифка не отправилась (битая ссылка) — пробуем хотя бы текст."""
+    try:
+        if gif:
+            await context.bot.send_animation(chat_id, animation=gif, caption=text, parse_mode=ParseMode.HTML)
+        else:
+            await context.bot.send_message(chat_id, text=text, parse_mode=ParseMode.HTML)
+        return True
+    except Exception as e:
+        print(f"[GREET] ошибка отправки ({'гифка' if gif else 'текст'}): {e}", flush=True)
+        if gif:
+            try:
+                await context.bot.send_message(chat_id, text=text, parse_mode=ParseMode.HTML)
+                return True
+            except Exception as e2:
+                print(f"[GREET] и текст не ушёл: {e2}", flush=True)
+        return False
+
+
+async def job_morning_greeting(context):
+    if not GREETINGS_ENABLED:
+        return
+    await _send_greeting(context, ALLOWED_CHAT_ID, build_morning_message(ALLOWED_CHAT_ID), await _morning_gif())
+    _greet_state["first_writer_day"] = None   # сброс — ждём первого писавшего сегодня
+
+
+async def job_night_greeting(context):
+    if not GREETINGS_ENABLED:
+        return
+    await _send_greeting(context, ALLOWED_CHAT_ID, build_night_message(), await _night_gif())
+
+
+async def maybe_first_writer(update, context, chat_id, user):
+    """Поздравляет первого, кто написал сегодня после утреннего часа. Срабатывает раз в сутки."""
+    if not GREETINGS_ENABLED or chat_id != ALLOWED_CHAT_ID or not user:
+        return
+    now = msk_now()
+    if now.hour < MORNING_HOUR:
+        return
+    today = now.date().isoformat()
+    if _greet_state.get("first_writer_day") == today:
+        return
+    _greet_state["first_writer_day"] = today
+    try:
+        await update.message.reply_text(
+            f"{pe('star')} Первым сегодня проснулся <b>{esc(user.full_name)}</b> — красава! "
+            f"{pe('fire')} С тебя заряд активности на весь день 💪",
+            parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+
+
 async def on_startup(app):
     """Автопроверка: после запуска бот пишет владельцу в личку — какая версия и когда поднялась.
     Если сообщение пришло — значит на сервере уже работает свежий код (а не старая сборка)."""
@@ -4748,6 +5201,19 @@ async def on_startup(app):
     except Exception as e:
         print(f"[STARTUP] не смог уведомить владельца ({LEADER_ID}): {e} — "
               f"возможно, владелец ещё не открывал личку с ботом.", flush=True)
+    # Планировщик авто-приветствий (нужна библиотека job-queue).
+    jq = getattr(app, "job_queue", None)
+    if jq and GREETINGS_ENABLED:
+        try:
+            from datetime import time as _dtime
+            jq.run_daily(job_morning_greeting, time=_dtime(MORNING_HOUR, 0, tzinfo=MSK), name="morning_greeting")
+            jq.run_daily(job_night_greeting, time=_dtime(NIGHT_HOUR, 0, tzinfo=MSK), name="night_greeting")
+            print(f"[GREET] приветствия запланированы: {MORNING_HOUR}:00 и {NIGHT_HOUR}:00 МСК", flush=True)
+        except Exception as e:
+            print(f"[GREET] не удалось запланировать приветствия: {e}", flush=True)
+    elif GREETINGS_ENABLED:
+        print("[GREET] планировщик недоступен — добавь 'python-telegram-bot[job-queue]' в requirements.txt, "
+              "иначе авто-приветствия по времени не работают.", flush=True)
 
 
 def main():
@@ -4767,6 +5233,8 @@ def main():
     app.add_handler(ChatMemberHandler(record_member, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(CallbackQueryHandler(giveaway_join, pattern="^gw_join$"))
     app.add_handler(CallbackQueryHandler(on_action_callback, pattern="^(menu|buy|order|appeal|faq|help|store):"))
+    app.add_handler(CallbackQueryHandler(on_docs_callback, pattern="^docs:"))
+    app.add_handler(CallbackQueryHandler(on_dailytop_callback, pattern="^td:"))
     app.add_handler(CallbackQueryHandler(on_unknown_callback))   # подстраховка: любой не пойманный колбэк
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, private_router))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, text_router))
