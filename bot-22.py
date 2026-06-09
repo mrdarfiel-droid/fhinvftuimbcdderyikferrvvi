@@ -225,8 +225,8 @@ CITADEL_BONUS_LP = 150
 # Имя бота — всегда LINKOR BOSS. UPDATE_NAME — название большого обновления (5.x = «Цитадель»).
 # Версия (5.2) — это патч в рамках этого обновления.
 BOT_FULL_NAME = "LINKOR BOSS"
-BOT_VERSION = "5.5"
-PATCH_CODE = "LB-5.5"
+BOT_VERSION = "5.6"
+PATCH_CODE = "LB-5.6"
 UPDATE_NAME = "Цитадель"        # название большого обновления (вся ветка 5.x)
 PATCH_NAME = UPDATE_NAME        # для совместимости со старым кодом
 PATCH_TYPE = "обновление"
@@ -237,6 +237,9 @@ RELEASE_DATE = "06.06.2026"
 # История изменений ДЛЯ УЧАСТНИКОВ по версиям (новые сверху). Без админских/секретных команд.
 # Формат: (версия, тип, [пункты])
 CHANGELOG_HISTORY = [
+    ("5.6", "улучшение", [
+        "😻 Гифки приветствий стали качественнее: и утром, и ночью бот берёт их из Giphy (чёткие, по теме). Свои избранные гифки можно положить в копилку — они в приоритете.",
+    ]),
     ("5.5", "обновление", [
         "🌙 Ночью бот тоже сам подбирает гифку — в спокойной теме (спящие котики / «спокойной ночи»). Утром бодрые котики, ночью — уютные.",
     ]),
@@ -4962,11 +4965,12 @@ MORNING_HOUR = 8        # час утреннего приветствия (МС
 NIGHT_HOUR = 22         # час ночного режима (МСК)
 MORNING_GIF = ""        # ссылка на гифку для утра (например, с котятами). Пусто — без гифки.
 NIGHT_GIF = ""          # ссылка на гифку для ночи. Пусто — без гифки.
-AUTO_CAT_GIFS = True    # утром бот сам берёт свежую гифку с котиком (The Cat API) — искать не нужно.
-CAT_API_KEY = ""        # необязательный бесплатный ключ thecatapi.com (для стабильности). Пусто — тоже работает.
-NIGHT_AUTO_GIFS = True  # ночью бот сам берёт спокойную тематическую гифку (нужен ключ Giphy ниже).
-GIPHY_API_KEY = ""      # бесплатный ключ с developers.giphy.com (для ночных авто-гифок). Пусто — берётся копилка.
-NIGHT_GIF_TAG = "sleepy cat"  # тема ночной гифки (например: sleepy cat, good night, calm night).
+AUTO_CAT_GIFS = True    # запасной источник утренних котиков (The Cat API), если ключ Giphy не задан.
+CAT_API_KEY = os.environ.get("CAT_API_KEY", "")       # необязательный ключ thecatapi.com.
+GIPHY_API_KEY = os.environ.get("GIPHY_API_KEY", "")   # ключ Giphy — ЗАДАЁТСЯ В ПЕРЕМЕННЫХ ОКРУЖЕНИЯ на BotHost (как токен).
+NIGHT_AUTO_GIFS = True  # ночью бот сам берёт спокойную тематическую гифку (через Giphy).
+MORNING_GIF_TAG = "funny cat"  # тема утренней гифки в Giphy (весёлые/играющие котики).
+NIGHT_GIF_TAG = "sleepy cat"   # тема ночной гифки в Giphy (например: sleepy cat, good night, calm night).
 
 # Наборы фраз: бот берёт по дню (каждый день другая, со временем повторяются — без шаблонности).
 _MORNING_LINES = [
@@ -5072,11 +5076,6 @@ def gif_random(kind):
     return row["file_id"] if row else ""
 
 
-def _greeting_gif(kind):
-    """Гифка для приветствия: сначала из копилки (надёжно, не теряется), иначе из настройки-ссылки."""
-    return gif_random(kind) or (MORNING_GIF if kind == "morning" else NIGHT_GIF)
-
-
 async def _fetch_cat_gif():
     """Берёт случайную гифку с котиком через бесплатный The Cat API (без ключа тоже работает)."""
     try:
@@ -5089,46 +5088,61 @@ async def _fetch_cat_gif():
             if isinstance(data, list) and data and data[0].get("url"):
                 return data[0]["url"]
     except Exception as e:
-        print(f"[GREET] не удалось получить кото-гифку: {e}", flush=True)
+        print(f"[GREET] не удалось получить кото-гифку (Cat API): {e}", flush=True)
     return ""
 
 
-async def _morning_gif():
-    """Утренняя гифка: сперва авто-котик (если включено), иначе копилка/ссылка."""
-    if AUTO_CAT_GIFS:
-        g = await _fetch_cat_gif()
-        if g:
-            return g
-    return _greeting_gif("morning")
-
-
-async def _fetch_night_gif():
-    """Берёт случайную спокойную гифку по теме через Giphy (нужен бесплатный ключ)."""
+async def _fetch_giphy_gif(tag):
+    """Случайная гифка по теме через Giphy (нужен ключ). Берём оригинал — это качественная версия."""
     if not GIPHY_API_KEY:
         return ""
     try:
         import urllib.parse
-        tag = urllib.parse.quote(NIGHT_GIF_TAG or "good night")
-        url = f"https://api.giphy.com/v1/gifs/random?api_key={GIPHY_API_KEY}&tag={tag}&rating=g"
+        q = urllib.parse.quote(tag or "cat")
+        url = f"https://api.giphy.com/v1/gifs/random?api_key={GIPHY_API_KEY}&tag={q}&rating=g"
         async with httpx.AsyncClient(timeout=12) as c:
             r = await c.get(url)
         if r.status_code == 200:
             d = (r.json() or {}).get("data") or {}
-            u = (((d.get("images") or {}).get("original") or {}).get("url")) or d.get("image_original_url")
+            imgs = d.get("images") or {}
+            # оригинал — лучшее качество; если нет, берём крупную уменьшенную версию
+            u = ((imgs.get("original") or {}).get("url")
+                 or (imgs.get("downsized_large") or {}).get("url")
+                 or d.get("image_original_url"))
             if u:
                 return u
+        else:
+            print(f"[GREET] Giphy вернул {r.status_code}", flush=True)
     except Exception as e:
-        print(f"[GREET] не удалось получить ночную гифку (Giphy): {e}", flush=True)
+        print(f"[GREET] не удалось получить гифку (Giphy): {e}", flush=True)
     return ""
 
 
-async def _night_gif():
-    """Ночная гифка: сперва авто-тема (если включено и есть ключ), иначе копилка/ссылка."""
-    if NIGHT_AUTO_GIFS:
-        g = await _fetch_night_gif()
+async def _morning_gif():
+    """Утренняя гифка. Приоритет: твоя копилка (лучшее качество) → Giphy → котосервис → ссылка."""
+    g = gif_random("morning")
+    if g:
+        return g
+    g = await _fetch_giphy_gif(MORNING_GIF_TAG)
+    if g:
+        return g
+    if AUTO_CAT_GIFS:
+        g = await _fetch_cat_gif()
         if g:
             return g
-    return _greeting_gif("night")
+    return MORNING_GIF
+
+
+async def _night_gif():
+    """Ночная гифка. Приоритет: твоя копилка → Giphy (спокойная тема) → ссылка."""
+    g = gif_random("night")
+    if g:
+        return g
+    if NIGHT_AUTO_GIFS:
+        g = await _fetch_giphy_gif(NIGHT_GIF_TAG)
+        if g:
+            return g
+    return NIGHT_GIF
 
 
 async def _send_greeting(context, chat_id, text, gif):
