@@ -225,8 +225,8 @@ CITADEL_BONUS_LP = 150
 # Имя бота — всегда LINKOR BOSS. UPDATE_NAME — название большого обновления (5.x = «Цитадель»).
 # Версия (5.2) — это патч в рамках этого обновления.
 BOT_FULL_NAME = "LINKOR BOSS"
-BOT_VERSION = "5.4"
-PATCH_CODE = "LB-5.4"
+BOT_VERSION = "5.5"
+PATCH_CODE = "LB-5.5"
 UPDATE_NAME = "Цитадель"        # название большого обновления (вся ветка 5.x)
 PATCH_NAME = UPDATE_NAME        # для совместимости со старым кодом
 PATCH_TYPE = "обновление"
@@ -237,6 +237,13 @@ RELEASE_DATE = "11.06.2026"
 # История изменений ДЛЯ УЧАСТНИКОВ по версиям (новые сверху). Без админских/секретных команд.
 # Формат: (версия, тип, [пункты])
 CHANGELOG_HISTORY = [
+    ("5.5", "обновление", [
+        "📋 Команда «нормы» — личный прогресс недели: сообщения, прирост кубков (живые данные из игры), отпуск, норм-варны и сроки проверки. До 22 июня показывает тренировочный режим и памятку правил.",
+        "🧪 Для админов: «нормы тест» — сухой прогон воскресной проверки (кто прошёл бы, кто нет — без штрафов) и «нормы снимок» — ручной снимок недели. Обкатываем систему ДО боевого старта 22 июня.",
+        "📣 Суббота, 12:00 — бот сам напоминает в чате тем, кто ещё не закрыл норму сообщений: впереди последний день.",
+        "⭐ «Первый писавший» теперь отмечается только утром (08:00–12:00) — после перезапуска бота днём или ночью ложных отметок больше нет.",
+        "🧹 Ушедшие из чата не попадают под проверку норм, снимки кубков и субботние напоминания.",
+    ]),
     ("5.4", "обновление", [
         "🛡 Закрыт эксплойт «вышел-зашёл»: перезаход больше не обнуляет варны и не выдаёт стартовые LP заново. Ушедшие теперь не стираются, а помечаются — история честная, при возврате всё на месте.",
         "🐞 Бот завёл журнал собственных ошибок: они сохраняются в базе, админам доступна команда «ошибки», счётчик попал в дневной отчёт. Баги больше не теряются.",
@@ -3107,6 +3114,46 @@ async def handle_triggers(update, context, text, low, parts):
         if await require(update, context, ADMIN):
             await cleanup_left_members(update, context)
         return True
+    if first in ("нормы", "норма", "norms"):
+        cid = ALLOWED_CHAT_ID if update.effective_chat.type == "private" else update.effective_chat.id
+        sub = parts[1] if len(parts) > 1 else ""
+        if sub in ("тест", "test", "прогон"):
+            if not await require(update, context, ADMIN):
+                return True
+            status = await update.message.reply_text(
+                f"{pe('clock')} Делаю сухой прогон проверки норм — опрашиваю кубки привязанных…",
+                parse_mode=ParseMode.HTML)
+            txt = await norm_dry_run(cid)
+            try:
+                await status.edit_text(txt, parse_mode=ParseMode.HTML)
+            except Exception:
+                await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
+            return True
+        if sub in ("снимок", "snapshot"):
+            if not await require(update, context, ADMIN):
+                return True
+            status = await update.message.reply_text(
+                f"{pe('clock')} Делаю снимок недели: отметки участников + кубки привязанных…",
+                parse_mode=ParseMode.HTML)
+            await run_norm_snapshot(context, cid)
+            n = conn.execute("SELECT COUNT(*) AS c FROM users WHERE chat_id=? AND trophy_base_week=?",
+                             (cid, week_bounds()[0])).fetchone()["c"]
+            done = (f"{pe('check')} Снимок недели готов. Кубки зафиксированы у <b>{n}</b> привязанных. "
+                    f"Теперь <code>.нормы тест</code> покажет полную картину.")
+            try:
+                await status.edit_text(done, parse_mode=ParseMode.HTML)
+            except Exception:
+                await update.message.reply_text(done, parse_mode=ParseMode.HTML)
+            return True
+        t = update.effective_user
+        if (len(parts) > 1 or update.message.reply_to_message) and await eff_role(update, context) >= MODER:
+            rt = await read_target(update, context, parts)
+            if rt not in (False, None):
+                t = rt
+        ensure_user(cid, t)
+        await update.message.reply_text(await norms_status_text(cid, t.id, t.full_name),
+                                        parse_mode=ParseMode.HTML)
+        return True
     if first in ("ошибки", "errors", "журналошибок"):
         if not await require(update, context, ADMIN):
             return True
@@ -3889,18 +3936,167 @@ async def maybe_finalize_season(context, chat_id):
     meta_set("season_cur", cur)
 
 
+async def norms_status_text(chat_id, user_id, name):
+    """5.5: личный прогресс по нормам недели — для команды «нормы»."""
+    row = conn.execute("SELECT * FROM users WHERE chat_id=? AND user_id=?", (chat_id, user_id)).fetchone()
+    if not row:
+        return f"{pe('cross')} Не нашёл такого участника в системе."
+    monday, sunday = week_bounds()
+    started = today_str() >= NORMS_START_DATE
+    msgs = stat_week(chat_id, user_id)
+    left = max(0, WEEKLY_MSG_NORM - msgs)
+    lines = [f"{pe('scroll')} <b>НОРМЫ НЕДЕЛИ — {esc(name)}</b>",
+             f"<i>Неделя {_fmt_day_human(monday)} – {_fmt_day_human(sunday)} · проверка в воскресенье ~21:00 МСК</i>"]
+    if not started:
+        lines.append(f"{pe('clock')} <b>Нормы стартуют {_fmt_day_human(NORMS_START_DATE)}.</b> Ниже — тренировочный прогресс.")
+    lines.append(f"{pe('msg')} Сообщения: <b>{msgs}</b> из {WEEKLY_MSG_NORM} "
+                 + (f"{pe('check')} норма закрыта!" if msgs >= WEEKLY_MSG_NORM
+                    else f"· осталось <b>{left}</b>"))
+    if row["brawl_tag"]:
+        if row["trophy_base_week"] == monday and row["trophy_base"] is not None:
+            gain = None
+            try:
+                data = await brawl_fetch(row["brawl_tag"])
+                if data:
+                    gain = int(data.get("trophies", 0)) - int(row["trophy_base"])
+            except Exception as e:
+                log_error("нормы (кубки)", e)
+            if gain is None:
+                lines.append(f"{pe('cup')} Кубки: <i>не удалось получить данные — попробуй чуть позже</i>")
+            else:
+                cup_left = max(0, WEEKLY_TROPHY_NORM - gain)
+                lines.append(f"{pe('cup')} Кубки за неделю: <b>{'+' if gain >= 0 else ''}{gain}</b> из +{WEEKLY_TROPHY_NORM} "
+                             + (f"{pe('check')} норма закрыта! (+{NORM_TROPHY_LP} LP в воскресенье)"
+                                if gain >= WEEKLY_TROPHY_NORM else f"· осталось <b>{cup_left}</b>"))
+        else:
+            lines.append(f"{pe('cup')} Кубки: <i>снимок этой недели не делался — будет в понедельник</i>")
+    else:
+        lines.append(f"{pe('cup')} Кубки: <i>тег не привязан</i> — <code>.tag #ТЕГ</code>")
+    if on_vacation(row):
+        lines.append(f"{pe('star')} Отпуск до <b>{row['vacation_until']}</b> — нормы на паузе.")
+    if started and soft_start_active():
+        soft_end = (datetime.fromisoformat(NORMS_START_DATE).date()
+                    + timedelta(weeks=SOFT_START_WEEKS)).strftime("%d.%m")
+        lines.append(f"{pe('shield')} Мягкий старт до {soft_end}: нормы считаются, штрафов нет.")
+    nw = count_norm_warns(chat_id, user_id)
+    if nw:
+        lines.append(f"{pe('warn')} Норм-варны: <b>{nw}</b> из {NORM_WARN_LIMIT}.")
+    if not started:
+        lines.append(f"<blockquote expandable>{pe('note')} <b>Как будет с {_fmt_day_human(NORMS_START_DATE)}:</b>\n"
+                     f"сообщения {WEEKLY_MSG_NORM}/нед; кубки +{WEEKLY_TROPHY_NORM}/нед → +{NORM_TROPHY_LP} LP; "
+                     f"провал нормы → −{NORM_FAIL_PENALTY} LP и норм-варн ({NORM_WARN_LIMIT} за месяц = исключение); "
+                     f"первые {SOFT_START_WEEKS} недели — мягкий старт без штрафов.</blockquote>")
+    return "\n".join(lines)
+
+
+async def norm_dry_run(chat_id):
+    """5.5: сухой прогон воскресной проверки — кто прошёл бы, кто нет. БЕЗ штрафов, наград и варнов.
+    Логику условий держать в синхроне с run_norm_check."""
+    monday = week_bounds()[0]
+    rows = conn.execute(
+        "SELECT user_id, name, brawl_tag, trophy_base, trophy_base_week, vacation_until, norm_anchor_week "
+        "FROM users WHERE chat_id=? AND COALESCE(gone,0)=0", (chat_id,)).fetchall()
+    anchored = any(r["norm_anchor_week"] == monday for r in rows)
+    ok, fail, skip = [], [], []
+    for r in rows:
+        uid = r["user_id"]
+        if uid in EXCLUDED_IDS or uid == LEADER_ID:
+            continue
+        if on_vacation(r):
+            skip.append(f"{esc(r['name'])} — отпуск")
+            continue
+        if anchored and r["norm_anchor_week"] != monday:
+            skip.append(f"{esc(r['name'])} — вступил среди недели")
+            continue
+        probs, oks = [], []
+        msgs = stat_week(chat_id, uid)
+        (oks if msgs >= WEEKLY_MSG_NORM else probs).append(f"сообщ. {msgs}/{WEEKLY_MSG_NORM}")
+        if r["brawl_tag"] and r["trophy_base_week"] == monday and r["trophy_base"] is not None:
+            try:
+                data = await brawl_fetch(r["brawl_tag"])
+            except Exception:
+                data = None
+            if data:
+                gain = int(data.get("trophies", 0)) - int(r["trophy_base"])
+                (oks if gain >= WEEKLY_TROPHY_NORM else probs).append(
+                    f"кубки {'+' if gain >= 0 else ''}{gain}/+{WEEKLY_TROPHY_NORM}")
+            else:
+                oks.append("кубки: API недоступен, пропуск")
+        (fail if probs else ok).append(f"{esc(r['name'])} — " + ", ".join(probs or oks))
+    head = (f"{pe('scales')} <b>СУХОЙ ПРОГОН НОРМ — без штрафов</b>\n"
+            f"<i>Неделя с {_fmt_day_human(monday)} · так выглядела бы воскресная проверка</i>")
+    if not anchored:
+        head += f"\n{pe('note')} <i>Отметок начала недели нет (до старта норм) — проверяю всех по текущей неделе.</i>"
+    elif soft_start_active() and today_str() >= NORMS_START_DATE:
+        head += f"\n{pe('shield')} <i>Идёт мягкий старт — штрафов не будет и в боевой проверке.</i>"
+    out = [head]
+    if ok:
+        out.append(f"{pe('check')} <b>Прошли бы ({len(ok)}):</b>\n<blockquote expandable>" + "\n".join(ok[:60]) + "</blockquote>")
+    if fail:
+        out.append(f"{pe('cross')} <b>Провалили бы ({len(fail)}):</b>\n<blockquote expandable>" + "\n".join(fail[:60]) + "</blockquote>")
+    if skip:
+        out.append(f"{pe('clock')} <b>Вне проверки ({len(skip)}):</b>\n<blockquote expandable>" + "\n".join(skip[:60]) + "</blockquote>")
+    if not (ok or fail):
+        out.append("<i>Проверять некого — в базе нет подходящих участников.</i>")
+    return "\n\n".join(out)
+
+
+NORM_REMIND_HOUR = 12   # 5.5: суббота, час напоминания не закрывшим норму сообщений (МСК)
+
+
+async def job_norm_reminder(context):
+    """5.5: суббота 12:00 — напоминаем в чате тем, кто ещё не закрыл норму сообщений."""
+    if not ALLOWED_CHAT_ID or today_str() < NORMS_START_DATE:
+        return
+    if msk_now().weekday() != 5:        # 5 = суббота
+        return
+    monday, _sun = week_bounds()
+    key = f"norm_remind_{monday}"
+    if meta_get(key):
+        return
+    meta_set(key, "1")
+    rows = conn.execute(
+        "SELECT user_id, name, username, vacation_until, norm_anchor_week FROM users "
+        "WHERE chat_id=? AND COALESCE(gone,0)=0", (ALLOWED_CHAT_ID,)).fetchall()
+    lag = []
+    for r in rows:
+        if r["user_id"] in EXCLUDED_IDS or r["user_id"] == LEADER_ID or on_vacation(r):
+            continue
+        if r["norm_anchor_week"] != monday:
+            continue
+        msgs = stat_week(ALLOWED_CHAT_ID, r["user_id"])
+        if msgs < WEEKLY_MSG_NORM:
+            ping = f"@{r['username']}" if r["username"] else esc(r["name"] or "?")
+            lag.append(f"{ping} ({msgs}/{WEEKLY_MSG_NORM})")
+    if not lag:
+        return
+    shown = ", ".join(lag[:25]) + (f" и ещё {len(lag) - 25}" if len(lag) > 25 else "")
+    soft_note = (f"\n{pe('shield')} <i>Идёт мягкий старт — штрафов не будет, но темп держим.</i>"
+                 if soft_start_active() else "")
+    try:
+        await context.bot.send_message(
+            ALLOWED_CHAT_ID,
+            f"{pe('mega')} <b>СУББОТА — последний рывок недели!</b>\n"
+            f"Норма сообщений ({WEEKLY_MSG_NORM}/нед) пока не закрыта у: {shown}.\n"
+            f"{pe('clock')} Проверка — завтра вечером. Свой прогресс: <code>.нормы</code>{soft_note}",
+            parse_mode=ParseMode.HTML)
+    except Exception as e:
+        log_error("суббота-напоминание", e)
+
+
 async def run_norm_snapshot(context, chat_id):
     """Начало недели: помечаем всех участников (для нормы активности) и снимаем кубки у привязанных."""
     monday = week_bounds()[0]
     # отметка присутствия на начало недели — для всех, кроме админов вне экономики (нужно для нормы активности)
     excl = tuple(EXCLUDED_IDS) or (0,)
     ph = ",".join("?" * len(excl))
-    conn.execute(f"UPDATE users SET norm_anchor_week=? WHERE chat_id=? AND user_id NOT IN ({ph})",
+    conn.execute(f"UPDATE users SET norm_anchor_week=? WHERE chat_id=? AND COALESCE(gone,0)=0 AND user_id NOT IN ({ph})",
                  (monday, chat_id, *excl))
     conn.commit()
     # снимок кубков — только у привязанных (и не в отпуске)
     rows = conn.execute(
-        "SELECT user_id, brawl_tag, vacation_until FROM users WHERE chat_id=? AND brawl_tag IS NOT NULL AND brawl_tag<>''",
+        "SELECT user_id, brawl_tag, vacation_until FROM users WHERE chat_id=? AND COALESCE(gone,0)=0 "
+        "AND brawl_tag IS NOT NULL AND brawl_tag<>''",
         (chat_id,)).fetchall()
     for r in rows:
         if on_vacation(r):
@@ -3924,7 +4120,7 @@ async def run_norm_check(context, chat_id, announce=True):
     soft = soft_start_active()
     rows = conn.execute(
         "SELECT user_id, name, brawl_tag, trophy_base, trophy_base_week, vacation_until, norm_anchor_week "
-        "FROM users WHERE chat_id=?", (chat_id,)).fetchall()
+        "FROM users WHERE chat_id=? AND COALESCE(gone,0)=0", (chat_id,)).fetchall()
     cup_done, cup_failed = [], []          # (имя, прирост[, варн])
     act_done, act_failed = [], []          # (имя, сообщений)
     excluded = []
@@ -4791,6 +4987,7 @@ def _help_section(key):
                 "• <code>.tag #ТВОЙТЕГ</code> — привязать профиль Brawl Stars\n"
                 "• <code>.top active</code> · <code>.top lp</code> · <code>.top rep</code> · <code>.top trophies</code> (+ <code>day</code>/<code>week</code>)\n"
                 "• <code>.streak</code> — серия дней подряд\n"
+                "• <code>.нормы</code> — твой прогресс по нормам недели (сообщения, кубки, сроки)\n"
                 "• <code>.season</code> — топ сезона · <code>.hof</code> — зал славы</blockquote>")
     if key == "clan":
         return (f"{pe('shop')} <b>Клан</b>\n<blockquote expandable>"
@@ -4830,6 +5027,7 @@ def _help_section(key):
                 "<code>.bonusall 150</code> · <code>.checknorms</code> · <code>.snapshotnorms</code> · "
                 "<code>.отчет</code> (официальный Excel-отчёт по чату за день: сводка, активность, графики, журнал — в личку)\n"
                 "<code>.ошибки</code> (журнал ошибок бота: что и когда сбоило)\n"
+                "<code>.нормы тест</code> / <code>.нормы снимок</code> — сухой прогон проверки норм и ручной снимок недели (обкатка до боевого старта)\n"
                 "<code>.утро</code> / <code>.ночь</code> — показать приветствие сейчас (для проверки; обычно бот шлёт сам в 8:00 и 22:00 МСК)\n"
                 "<code>.добавитьгиф утро/ночь</code> (ответом на гифку) · <code>.гифы</code> · <code>.очиститьгифы утро/ночь</code> — копилка гифок для приветствий\n\n"
                 "<b>Опрос:</b> <code>.poll Вопрос? | вар1 | вар2</code>\n"
@@ -5024,6 +5222,7 @@ async def on_unknown_callback(update, context):
 GREETINGS_ENABLED = True
 MORNING_HOUR = 8        # час утреннего приветствия (МСК)
 NIGHT_HOUR = 22         # час ночного режима (МСК)
+FIRST_WRITER_UNTIL = 12  # 5.5: «первый писавший» отмечается ТОЛЬКО в окне утра (8:00–12:00 МСК)
 MORNING_GIF = ""        # ссылка на гифку для утра (например, с котятами). Пусто — без гифки.
 NIGHT_GIF = ""          # ссылка на гифку для ночи. Пусто — без гифки.
 AUTO_CAT_GIFS = True    # запасной источник утренних котиков (The Cat API), если ключ Giphy не задан.
@@ -5245,8 +5444,8 @@ async def maybe_first_writer(update, context, chat_id, user):
     if not GREETINGS_ENABLED or chat_id != ALLOWED_CHAT_ID or not user:
         return
     now = msk_now()
-    if now.hour < MORNING_HOUR:
-        return
+    if not (MORNING_HOUR <= now.hour < FIRST_WRITER_UNTIL):
+        return   # 5.5: только утреннее окно — после деплоя днём или ночью отметка не срабатывает
     today = now.date().isoformat()
     if meta_get("first_writer_day") == today:
         return
@@ -5294,7 +5493,8 @@ async def on_startup(app):
         try:
             from datetime import time as _dtime
             jq.run_daily(job_daily_report, time=_dtime(23, 59, tzinfo=MSK), name="daily_report")
-            print("[ОТЧЁТ] ежедневный отчёт запланирован на 23:59 МСК", flush=True)
+            jq.run_daily(job_norm_reminder, time=_dtime(NORM_REMIND_HOUR, 0, tzinfo=MSK), name="norm_reminder")
+            print("[ОТЧЁТ] ежедневный отчёт запланирован на 23:59 МСК; напоминание о нормах — Сб 12:00", flush=True)
         except Exception as e:
             log_error("планировщик отчёта", e)
 
