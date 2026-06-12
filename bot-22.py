@@ -225,8 +225,8 @@ CITADEL_BONUS_LP = 150
 # Имя бота — всегда LINKOR BOSS. UPDATE_NAME — название большого обновления (5.x = «Цитадель»).
 # Версия (5.2) — это патч в рамках этого обновления.
 BOT_FULL_NAME = "LINKOR BOSS"
-BOT_VERSION = "5.5"
-PATCH_CODE = "LB-5.5"
+BOT_VERSION = "5.6"
+PATCH_CODE = "LB-5.6"
 UPDATE_NAME = "Цитадель"        # название большого обновления (вся ветка 5.x)
 PATCH_NAME = UPDATE_NAME        # для совместимости со старым кодом
 PATCH_TYPE = "обновление"
@@ -237,6 +237,14 @@ RELEASE_DATE = "11.06.2026"
 # История изменений ДЛЯ УЧАСТНИКОВ по версиям (новые сверху). Без админских/секретных команд.
 # Формат: (версия, тип, [пункты])
 CHANGELOG_HISTORY = [
+    ("5.6", "обновление", [
+        "🏅 ЭКСПЕРИМЕНТ — ранги Brawl Stars: бот читает ранговые бои из журнала и определяет ступень ранга. «ранг» — твой лучший замеченный ранг, «топ ранг» — топ клана по рангам.",
+        "🔭 Каждый день в 13:00 бот сам сканирует журналы боёв привязанных участников и запоминает лучший ранг.",
+        "🧪 Для админов: «ранг тест» — сырые значения из ранговых боёв для сверки карты рангов (метод неофициальный, поэтому проверяем боем).",
+        "🔬 Диагностика активности: в «нормах» — разбивка сообщений по дням недели; команда «актив» (для модераторов, ответом на человека) показывает сырые записи счётчика; сбои счётчика теперь попадают в журнал ошибок.",
+        "🛡 Защита снимка кубков: повторный «нормы снимок» в ту же неделю обнулил бы прирост у всех — теперь бот предупреждает и требует слово «заново». Везде показывается время снимка, а в личных «нормах» — «было → сейчас» по кубкам.",
+        "🛠 Полировка: в прогоне норм вместо пустых имён теперь @ник или ID; у проваливших видна и выполненная часть («ок: сообщ. 2150/450»); исправлено «++0» в команде lp — и ноль LP теперь вежливо отклоняется.",
+    ]),
     ("5.5", "обновление", [
         "📋 Команда «нормы» — личный прогресс недели: сообщения, прирост кубков (живые данные из игры), отпуск, норм-варны и сроки проверки. До 22 июня показывает тренировочный режим и памятку правил.",
         "🧪 Для админов: «нормы тест» — сухой прогон воскресной проверки (кто прошёл бы, кто нет — без штрафов) и «нормы снимок» — ручной снимок недели. Обкатываем систему ДО боевого старта 22 июня.",
@@ -545,6 +553,8 @@ def init_db():
     _add_col("users", "tag_warns", "INTEGER DEFAULT 0")    # счётчик тег-варнов (нет тега)
     _add_col("users", "tag_warn_last", "TEXT")             # дата последнего тег-варна (YYYY-MM-DD)
     _add_col("users", "gone", "INTEGER DEFAULT 0")         # 5.4: 1 = вышел из чата (история сохраняется)
+    _add_col("users", "rank_best", "INTEGER")              # 5.6: лучшее замеченное «сырое» значение ранга
+    _add_col("users", "rank_seen", "TEXT")                 # 5.6: дата, когда лучший ранг был замечен
     conn.execute("""CREATE TABLE IF NOT EXISTS errors (
         id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, place TEXT, text TEXT)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS norm_warns (
@@ -885,6 +895,20 @@ def lp_day_flows(chat_id, day):
     return round(row["pos"], 2), round(abs(row["neg"]), 2)
 
 
+def disp_name(row):
+    """5.6: имя для вывода — name → @username → ID. Спасает от пустых/битых имён Telegram («?», пустые строки)."""
+    try:
+        n = (row["name"] or "").strip()
+        if n and n != "?":
+            return n
+        un = row["username"] if "username" in row.keys() else None
+        if un:
+            return "@" + un
+        return f"ID:{row['user_id']}"
+    except Exception:
+        return "?"
+
+
 def season_top(chat_id, season, limit=10):
     """Топ участников по числу сообщений за месяц season ('YYYY-MM'). Без админов вне экономики,
     владельца (5.4) и ушедших."""
@@ -1094,6 +1118,79 @@ async def brawl_fetch(tag):
     except Exception as e:
         print(f"[BRAWL] ошибка запроса: {e}", flush=True)
     return None
+
+
+# ===== 5.6 «РАЗВЕДКА»: ранговый режим Brawl Stars (ЭКСПЕРИМЕНТ) =====
+# Официальный API ранг игрока не отдаёт. Но в журнале боёв ранговые матчи помечены типом
+# "soloRanked", и поле trophies игрока в ТАКОМ бою кодирует ступень ранга, а не кубки.
+# Карта ступеней ниже — предположительная (так делают сторонние трекеры); сверяется живыми
+# боями через команду «ранг тест». При расхождении правим ТОЛЬКО списки/формулу здесь.
+_RANK_TIERS = ["Бронза", "Серебро", "Золото", "Алмаз", "Мифик", "Легенда", "Мастер", "Про"]
+_ROMAN = {1: "I", 2: "II", 3: "III"}
+LEGEND_VALUE_MIN = 16   # «Легенда I» по предположительной карте (для будущей нормы)
+
+
+def rank_name(v):
+    """Название ступени ранга по «сырому» значению из журнала боёв."""
+    try:
+        v = int(v)
+    except Exception:
+        return "?"
+    if v <= 0:
+        return "без ранга"
+    tier, step = (v - 1) // 3, (v - 1) % 3 + 1
+    if tier < len(_RANK_TIERS):
+        return f"{_RANK_TIERS[tier]} {_ROMAN[step]}"
+    return f"ступень {v}"
+
+
+async def brawl_battlelog(tag):
+    """Журнал последних боёв игрока (до 25). None при ошибке/без ключа."""
+    if not BRAWL_API_KEY:
+        return None
+    t = (tag or "").strip().upper().lstrip("#")
+    url = f"{BRAWL_API_BASE}/players/%23{t}/battlelog"
+    headers = {"Authorization": f"Bearer {BRAWL_API_KEY}", "Accept": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(url, headers=headers)
+        if r.status_code == 200:
+            return r.json()
+        print(f"[BRAWL] battlelog HTTP {r.status_code} для #{t}", flush=True)
+    except Exception as e:
+        log_error("battlelog", e)
+    return None
+
+
+def extract_ranked_entries(data, tag):
+    """Достаёт из журнала боёв ранговые матчи (soloRanked) и «сырое» значение ранга игрока.
+    Возвращает список (новые сверху): {ts, mode, map, result, value}."""
+    t = "#" + (tag or "").strip().upper().lstrip("#")
+    out = []
+    for it in (data or {}).get("items", []) or []:
+        b = it.get("battle") or {}
+        if b.get("type") != "soloRanked":
+            continue
+        val = None
+        groups = b.get("teams") or ([b.get("players")] if b.get("players") else [])
+        for team in groups:
+            for p in team or []:
+                if (p.get("tag") or "").upper() == t:
+                    val = (p.get("brawler") or {}).get("trophies")
+        if val is None:
+            continue
+        ev = it.get("event") or {}
+        out.append({"ts": it.get("battleTime", ""), "mode": ev.get("mode", "?"),
+                    "map": ev.get("map", "?"), "result": b.get("result", "?"), "value": int(val)})
+    return out
+
+
+def _bs_dt(ts):
+    """'20260611T120000.000Z' → '11.06 12:00' (UTC)."""
+    try:
+        return f"{ts[6:8]}.{ts[4:6]} {ts[9:11]}:{ts[11:13]}"
+    except Exception:
+        return "?"
 
 
 def brawl_cached(tag):
@@ -3114,6 +3211,123 @@ async def handle_triggers(update, context, text, low, parts):
         if await require(update, context, ADMIN):
             await cleanup_left_members(update, context)
         return True
+    if first in ("актив", "activity", "статдни"):
+        if not await require(update, context, MODER):
+            return True
+        cid = ALLOWED_CHAT_ID if update.effective_chat.type == "private" else update.effective_chat.id
+        rt = await read_target(update, context, parts)
+        t = rt if rt not in (False, None) else update.effective_user
+        mon, sun = week_bounds()
+        rows = conn.execute(
+            "SELECT day, cnt FROM stats WHERE chat_id=? AND user_id=? AND day BETWEEN ? AND ? ORDER BY day",
+            (cid, t.id, mon, sun)).fetchall()
+        det = "\n".join(f"{r['day']}: <b>{r['cnt']}</b>" for r in rows) or "<i>записей за эту неделю нет</i>"
+        await update.message.reply_text(
+            f"{pe('stats')} <b>АКТИВ (сырые записи счётчика) — {esc(t.full_name)}</b>\n"
+            f"<i>неделя {mon} → {sun} · ID {t.id}</i>\n"
+            f"<blockquote>{det}</blockquote>\n"
+            f"Сумма за неделю: <b>{stat_week(cid, t.id)}</b> · сегодня: <b>{stat_today(cid, t.id)}</b>",
+            parse_mode=ParseMode.HTML)
+        return True
+    if first in ("ранг", "rank"):
+        cid = ALLOWED_CHAT_ID if update.effective_chat.type == "private" else update.effective_chat.id
+        sub = parts[1] if len(parts) > 1 else ""
+        if sub in ("тест", "test"):
+            if not await require(update, context, ADMIN):
+                return True
+            tag = next((p for p in parts[2:] if p.startswith("#")), None)
+            if not tag:
+                me = conn.execute("SELECT brawl_tag FROM users WHERE chat_id=? AND user_id=?",
+                                  (cid, update.effective_user.id)).fetchone()
+                tag = me["brawl_tag"] if me and me["brawl_tag"] else None
+            if not tag:
+                await update.message.reply_text(
+                    f"{pe('note')} Укажи тег: <code>.ранг тест #ТЕГ</code> (или сначала привяжи свой: <code>.tag #ТЕГ</code>).",
+                    parse_mode=ParseMode.HTML)
+                return True
+            status = await update.message.reply_text(
+                f"{pe('clock')} Читаю журнал боёв <code>{esc(tag)}</code> — ищу ранговые матчи…",
+                parse_mode=ParseMode.HTML)
+            data = await brawl_battlelog(tag)
+            if data is None:
+                txt = f"{pe('cross')} Не удалось получить журнал боёв (API недоступен или тег неверный)."
+            else:
+                ent = extract_ranked_entries(data, tag)
+                if not ent:
+                    txt = (f"{pe('note')} В последних 25 боях <code>{esc(tag)}</code> <b>нет ранговых матчей</b>.\n"
+                           f"Сыграй ранговую и повтори <code>.ранг тест</code> — журнал хранит только 25 последних боёв.")
+                else:
+                    rows_txt = "\n".join(
+                        f"{_bs_dt(e['ts'])} · {esc(str(e['result']))} · значение <b>{e['value']}</b> → {rank_name(e['value'])}"
+                        for e in ent[:6])
+                    mx = max(e["value"] for e in ent)
+                    txt = (f"{pe('stats')} <b>РАНГ ТЕСТ — сырые данные из журнала боёв</b>\n"
+                           f"Тег: <code>{esc(tag)}</code> · ранговых боёв в журнале: <b>{len(ent)}</b>\n"
+                           f"<blockquote expandable>{rows_txt}</blockquote>\n"
+                           f"{pe('cup')} Максимум: <b>{mx}</b> → по карте это <b>{rank_name(mx)}</b>\n"
+                           f"<i>Сверь с реальным рангом в игре и пришли скрин — если расходится, поправим карту. "
+                           f"Метод экспериментальный.</i>")
+            try:
+                await status.edit_text(txt, parse_mode=ParseMode.HTML)
+            except Exception:
+                await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
+            return True
+        # .ранг — свой (или цель для модераторов)
+        t = update.effective_user
+        if (len(parts) > 1 or update.message.reply_to_message) and await eff_role(update, context) >= MODER:
+            rt = await read_target(update, context, parts)
+            if rt not in (False, None):
+                t = rt
+        ensure_user(cid, t)
+        row = conn.execute("SELECT brawl_tag, rank_best, rank_seen FROM users WHERE chat_id=? AND user_id=?",
+                           (cid, t.id)).fetchone()
+        if not row or not row["brawl_tag"]:
+            await update.message.reply_text(
+                f"{pe('note')} Сначала привяжи тег: <code>.tag #ТЕГ</code> — и сыграй ранговые бои.",
+                parse_mode=ParseMode.HTML)
+            return True
+        best = row["rank_best"]
+        # живая проверка: вдруг в журнале есть бой выше сохранённого
+        data = await brawl_battlelog(row["brawl_tag"])
+        ent = extract_ranked_entries(data, row["brawl_tag"]) if data else []
+        if ent:
+            mx = max(e["value"] for e in ent)
+            if best is None or mx > best:
+                best = mx
+                conn.execute("UPDATE users SET rank_best=?, rank_seen=? WHERE chat_id=? AND user_id=?",
+                             (best, today_str(), cid, t.id))
+                conn.commit()
+        if best is None:
+            await update.message.reply_text(
+                f"{pe('note')} <b>{esc(t.full_name)}</b>: ранговых боёв пока не видно. "
+                f"Сыграй ранговую — бот заметит сам (сканирует журналы ежедневно) или сразу после боя набери <code>.ранг</code>.\n"
+                f"<i>Журнал хранит 25 последних боёв.</i>", parse_mode=ParseMode.HTML)
+            return True
+        seen = row["rank_seen"] or today_str()
+        await update.message.reply_text(
+            f"{pe('cup')} <b>РАНГ — {esc(t.full_name)}</b>\n"
+            f"Лучший замеченный: <b>{rank_name(best)}</b> <i>(значение {best}, на {_fmt_day_human(seen)})</i>\n"
+            f"<i>Эксперимент: ранг читается из журнала боёв, метод неофициальный.</i>",
+            parse_mode=ParseMode.HTML)
+        return True
+    if first in ("топранг", "rankedtop") or \
+       (first in ("top", "топ") and len(parts) > 1 and parts[1] in ("ранг", "ранги", "rank", "ranked")):
+        rows = conn.execute(
+            "SELECT name, username, user_id, rank_best AS val FROM users WHERE chat_id=? AND rank_best IS NOT NULL "
+            "AND COALESCE(gone,0)=0 AND user_id<>? ORDER BY val DESC, name LIMIT 10",
+            (update.effective_chat.id, LEADER_ID)).fetchall()
+        if not rows:
+            await update.message.reply_text(
+                f"{pe('game')} Пока ни у кого не замечен ранг. Привяжите теги (<code>.tag #ТЕГ</code>) и играйте ранговые — "
+                f"бот сканирует журналы ежедневно.", parse_mode=ParseMode.HTML)
+            return True
+        medals = ["🥇", "🥈", "🥉"]
+        lines = [f"{(medals[i] if i < 3 else str(i + 1) + '.')} {esc(disp_name(r))} — <b>{rank_name(r['val'])}</b>"
+                 for i, r in enumerate(rows)]
+        await update.message.reply_text(
+            f"{pe('cup')} <b>ТОП {CLAN_NAME} — по рангам</b>\n<i>лучший замеченный за сезон · эксперимент</i>\n\n"
+            + "\n".join(lines), parse_mode=ParseMode.HTML)
+        return True
     if first in ("нормы", "норма", "norms"):
         cid = ALLOWED_CHAT_ID if update.effective_chat.type == "private" else update.effective_chat.id
         sub = parts[1] if len(parts) > 1 else ""
@@ -3131,6 +3345,13 @@ async def handle_triggers(update, context, text, low, parts):
             return True
         if sub in ("снимок", "snapshot"):
             if not await require(update, context, ADMIN):
+                return True
+            if meta_get("trophy_snapshot_week") == week_bounds()[0] and not any(
+                    p in ("заново", "force") for p in parts[2:]):
+                await update.message.reply_text(
+                    f"{pe('warn')} Снимок этой недели <b>уже сделан</b> ({meta_get('trophy_snapshot_ts') or '—'} МСК). "
+                    f"Повторный снимок <b>обнулит прирост кубков</b> у всех — поэтому я его не делаю.\n"
+                    f"Если точно нужно: <code>.нормы снимок заново</code>.", parse_mode=ParseMode.HTML)
                 return True
             status = await update.message.reply_text(
                 f"{pe('clock')} Делаю снимок недели: отметки участников + кубки привязанных…",
@@ -3346,9 +3567,16 @@ async def handle_triggers(update, context, text, low, parts):
                     await update.message.reply_text("Формат: lp =500")
             else:
                 try:
-                    val = add_lp(update.effective_chat.id, tgt.id, int(arg))
-                    sign = "+" if int(arg) >= 0 else ""
-                    await update.message.reply_text(f"{pe('lp')} {sign}{arg} LP → <b>{esc(tgt.full_name)}</b>. Баланс: <b>{fmt_lp(val)}</b>.", parse_mode=ParseMode.HTML)
+                    n = int(arg)
+                    if n == 0:
+                        await update.message.reply_text(
+                            f"{pe('note')} Ноль LP ничего не изменит 😄 Укажи число: <code>lp 200</code> или <code>lp -50</code>.",
+                            parse_mode=ParseMode.HTML)
+                        return True
+                    val = add_lp(update.effective_chat.id, tgt.id, n)
+                    await update.message.reply_text(
+                        f"{pe('lp')} {'+' if n > 0 else ''}{n} LP → <b>{esc(tgt.full_name)}</b>. Баланс: <b>{fmt_lp(val)}</b>.",
+                        parse_mode=ParseMode.HTML)
                 except ValueError:
                     await update.message.reply_text("Формат: lp 200 / lp -50 / lp =500")
             return True
@@ -3952,13 +4180,22 @@ async def norms_status_text(chat_id, user_id, name):
     lines.append(f"{pe('msg')} Сообщения: <b>{msgs}</b> из {WEEKLY_MSG_NORM} "
                  + (f"{pe('check')} норма закрыта!" if msgs >= WEEKLY_MSG_NORM
                     else f"· осталось <b>{left}</b>"))
+    _days_ru = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+    _mon_d = datetime.fromisoformat(monday).date()
+    per = []
+    for k in range(7):
+        c = conn.execute("SELECT COALESCE(SUM(cnt),0) FROM stats WHERE chat_id=? AND user_id=? AND day=?",
+                         (chat_id, user_id, (_mon_d + timedelta(days=k)).isoformat())).fetchone()[0]
+        per.append(f"{_days_ru[k]} {c}")
+    lines.append(f"<i>по дням: {' · '.join(per)}</i>")
     if row["brawl_tag"]:
         if row["trophy_base_week"] == monday and row["trophy_base"] is not None:
-            gain = None
+            gain, cur = None, None
             try:
                 data = await brawl_fetch(row["brawl_tag"])
                 if data:
-                    gain = int(data.get("trophies", 0)) - int(row["trophy_base"])
+                    cur = int(data.get("trophies", 0))
+                    gain = cur - int(row["trophy_base"])
             except Exception as e:
                 log_error("нормы (кубки)", e)
             if gain is None:
@@ -3968,6 +4205,7 @@ async def norms_status_text(chat_id, user_id, name):
                 lines.append(f"{pe('cup')} Кубки за неделю: <b>{'+' if gain >= 0 else ''}{gain}</b> из +{WEEKLY_TROPHY_NORM} "
                              + (f"{pe('check')} норма закрыта! (+{NORM_TROPHY_LP} LP в воскресенье)"
                                 if gain >= WEEKLY_TROPHY_NORM else f"· осталось <b>{cup_left}</b>"))
+                lines.append(f"<i>снимок {meta_get('trophy_snapshot_ts') or '—'}: было {row['trophy_base']} → сейчас {cur}</i>")
         else:
             lines.append(f"{pe('cup')} Кубки: <i>снимок этой недели не делался — будет в понедельник</i>")
     else:
@@ -3994,7 +4232,7 @@ async def norm_dry_run(chat_id):
     Логику условий держать в синхроне с run_norm_check."""
     monday = week_bounds()[0]
     rows = conn.execute(
-        "SELECT user_id, name, brawl_tag, trophy_base, trophy_base_week, vacation_until, norm_anchor_week "
+        "SELECT user_id, name, username, brawl_tag, trophy_base, trophy_base_week, vacation_until, norm_anchor_week "
         "FROM users WHERE chat_id=? AND COALESCE(gone,0)=0", (chat_id,)).fetchall()
     anchored = any(r["norm_anchor_week"] == monday for r in rows)
     ok, fail, skip = [], [], []
@@ -4003,10 +4241,10 @@ async def norm_dry_run(chat_id):
         if uid in EXCLUDED_IDS or uid == LEADER_ID:
             continue
         if on_vacation(r):
-            skip.append(f"{esc(r['name'])} — отпуск")
+            skip.append(f"{esc(disp_name(r))} — отпуск")
             continue
         if anchored and r["norm_anchor_week"] != monday:
-            skip.append(f"{esc(r['name'])} — вступил среди недели")
+            skip.append(f"{esc(disp_name(r))} — вступил среди недели")
             continue
         probs, oks = [], []
         msgs = stat_week(chat_id, uid)
@@ -4022,9 +4260,13 @@ async def norm_dry_run(chat_id):
                     f"кубки {'+' if gain >= 0 else ''}{gain}/+{WEEKLY_TROPHY_NORM}")
             else:
                 oks.append("кубки: API недоступен, пропуск")
-        (fail if probs else ok).append(f"{esc(r['name'])} — " + ", ".join(probs or oks))
+        line = f"{esc(disp_name(r))} — " + ", ".join(probs or oks)
+        if probs and oks:
+            line += f" · ок: {', '.join(oks)}"
+        (fail if probs else ok).append(line)
     head = (f"{pe('scales')} <b>СУХОЙ ПРОГОН НОРМ — без штрафов</b>\n"
-            f"<i>Неделя с {_fmt_day_human(monday)} · так выглядела бы воскресная проверка</i>")
+            f"<i>Неделя с {_fmt_day_human(monday)} · так выглядела бы воскресная проверка</i>\n"
+            f"{pe('cup')} <i>Кубки считаются с момента снимка ({meta_get('trophy_snapshot_ts') or 'снимка ещё не было'}).</i>")
     if not anchored:
         head += f"\n{pe('note')} <i>Отметок начала недели нет (до старта норм) — проверяю всех по текущей неделе.</i>"
     elif soft_start_active() and today_str() >= NORMS_START_DATE:
@@ -4042,6 +4284,36 @@ async def norm_dry_run(chat_id):
 
 
 NORM_REMIND_HOUR = 12   # 5.5: суббота, час напоминания не закрывшим норму сообщений (МСК)
+
+
+RANK_SCAN_HOUR = 13     # 5.6: час ежедневного сканирования рангов по журналам боёв (МСК)
+
+
+async def job_rank_scan(context):
+    """5.6: ежедневный скан журналов боёв привязанных участников — запоминаем лучший замеченный ранг."""
+    if not ALLOWED_CHAT_ID:
+        return
+    day = today_str()
+    if meta_get("rank_scan_day") == day:
+        return
+    meta_set("rank_scan_day", day)
+    rows = conn.execute(
+        "SELECT user_id, brawl_tag, rank_best FROM users WHERE chat_id=? AND COALESCE(gone,0)=0 "
+        "AND brawl_tag IS NOT NULL AND brawl_tag<>''", (ALLOWED_CHAT_ID,)).fetchall()
+    updated = 0
+    for r in rows:
+        data = await brawl_battlelog(r["brawl_tag"])
+        ent = extract_ranked_entries(data, r["brawl_tag"]) if data else []
+        if ent:
+            mx = max(e["value"] for e in ent)
+            if r["rank_best"] is None or mx > r["rank_best"]:
+                conn.execute("UPDATE users SET rank_best=?, rank_seen=? WHERE chat_id=? AND user_id=?",
+                             (mx, day, ALLOWED_CHAT_ID, r["user_id"]))
+                updated += 1
+        await asyncio.sleep(0.4)   # бережём API
+    conn.commit()
+    if updated:
+        print(f"[РАНГ] скан завершён: рангов обновлено — {updated}", flush=True)
 
 
 async def job_norm_reminder(context):
@@ -4066,7 +4338,7 @@ async def job_norm_reminder(context):
             continue
         msgs = stat_week(ALLOWED_CHAT_ID, r["user_id"])
         if msgs < WEEKLY_MSG_NORM:
-            ping = f"@{r['username']}" if r["username"] else esc(r["name"] or "?")
+            ping = f"@{r['username']}" if r["username"] else esc(disp_name(r))
             lag.append(f"{ping} ({msgs}/{WEEKLY_MSG_NORM})")
     if not lag:
         return
@@ -4111,6 +4383,8 @@ async def run_norm_snapshot(context, chat_id):
         conn.execute("UPDATE users SET trophy_base=?, trophy_base_week=?, brawl_trophies=?, brawl_name=? WHERE chat_id=? AND user_id=?",
                      (tro, monday, tro, data.get("name"), chat_id, r["user_id"]))
     conn.commit()
+    meta_set("trophy_snapshot_week", monday)                      # 5.6: защита от повторного обнуления
+    meta_set("trophy_snapshot_ts", msk_now().strftime("%d.%m %H:%M"))
 
 
 async def run_norm_check(context, chat_id, announce=True):
@@ -4119,13 +4393,14 @@ async def run_norm_check(context, chat_id, announce=True):
     monday = week_bounds()[0]
     soft = soft_start_active()
     rows = conn.execute(
-        "SELECT user_id, name, brawl_tag, trophy_base, trophy_base_week, vacation_until, norm_anchor_week "
+        "SELECT user_id, name, username, brawl_tag, trophy_base, trophy_base_week, vacation_until, norm_anchor_week "
         "FROM users WHERE chat_id=? AND COALESCE(gone,0)=0", (chat_id,)).fetchall()
     cup_done, cup_failed = [], []          # (имя, прирост[, варн])
     act_done, act_failed = [], []          # (имя, сообщений)
     excluded = []
     for r in rows:
         uid = r["user_id"]
+        nm = disp_name(r)
         if uid in EXCLUDED_IDS or uid == LEADER_ID or on_vacation(r):
             continue
         if r["norm_anchor_week"] != monday:
@@ -4141,23 +4416,23 @@ async def run_norm_check(context, chat_id, announce=True):
                 gain = int(data.get("trophies", 0)) - int(r["trophy_base"])
                 if gain >= WEEKLY_TROPHY_NORM:
                     add_lp(chat_id, uid, NORM_TROPHY_LP)
-                    cup_done.append((r["name"], gain))
+                    cup_done.append((nm, gain))
                 elif soft:
-                    cup_failed.append((r["name"], gain, 0))
+                    cup_failed.append((nm, gain, 0))
                 else:
                     add_lp(chat_id, uid, -NORM_FAIL_PENALTY)
                     failed_any = True
-                    cup_failed.append((r["name"], gain, None))
+                    cup_failed.append((nm, gain, None))
         # --- НОРМА АКТИВНОСТИ (у всех присутствовавших на старте недели) ---
         msgs = stat_week(chat_id, uid)
         if msgs >= WEEKLY_MSG_NORM:
-            act_done.append((r["name"], msgs))
+            act_done.append((nm, msgs))
         elif soft:
-            act_failed.append((r["name"], msgs))
+            act_failed.append((nm, msgs))
         else:
             add_lp(chat_id, uid, -NORM_FAIL_PENALTY)
             failed_any = True
-            act_failed.append((r["name"], msgs))
+            act_failed.append((nm, msgs))
         # --- НОРМ-ВАРН: максимум один в неделю, если провалена хотя бы одна норма ---
         if failed_any and not soft:
             nw = add_norm_warn(chat_id, uid)
@@ -4168,7 +4443,7 @@ async def run_norm_check(context, chat_id, announce=True):
                     pass
                 conn.execute("DELETE FROM norm_warns WHERE chat_id=? AND user_id=?", (chat_id, uid))
                 conn.commit()
-                excluded.append(r["name"])
+                excluded.append(nm)
     if announce and (cup_done or cup_failed or act_done or act_failed or excluded):
         P = [f"{pe('cup')} <b>ИТОГИ НЕДЕЛИ — НОРМЫ ({CLAN_NAME})</b>\n{CLAN_LINE}"]
         if soft:
@@ -4793,7 +5068,8 @@ async def counter(update, context):
         ensure_user(chat_id, user)
         if not is_cmd:
             stat_add(chat_id, user.id)
-    except Exception:
+    except Exception as e:
+        log_error("счётчик", e)   # 5.6: если у кого-то «теряются» сообщения — увидим в .ошибки
         return
     # буфер последних сообщений для AI-сводки
     if update.message and update.message.text and not is_cmd:
@@ -4988,6 +5264,7 @@ def _help_section(key):
                 "• <code>.top active</code> · <code>.top lp</code> · <code>.top rep</code> · <code>.top trophies</code> (+ <code>day</code>/<code>week</code>)\n"
                 "• <code>.streak</code> — серия дней подряд\n"
                 "• <code>.нормы</code> — твой прогресс по нормам недели (сообщения, кубки, сроки)\n"
+                "• <code>.ранг</code> — твой ранг в ранговых боях · <code>.топ ранг</code> — топ клана (эксперимент)\n"
                 "• <code>.season</code> — топ сезона · <code>.hof</code> — зал славы</blockquote>")
     if key == "clan":
         return (f"{pe('shop')} <b>Клан</b>\n<blockquote expandable>"
@@ -5028,6 +5305,7 @@ def _help_section(key):
                 "<code>.отчет</code> (официальный Excel-отчёт по чату за день: сводка, активность, графики, журнал — в личку)\n"
                 "<code>.ошибки</code> (журнал ошибок бота: что и когда сбоило)\n"
                 "<code>.нормы тест</code> / <code>.нормы снимок</code> — сухой прогон проверки норм и ручной снимок недели (обкатка до боевого старта)\n"
+                "<code>.ранг тест [#ТЕГ]</code> — сырые значения рангов из журнала боёв (сверка карты рангов)\n"
                 "<code>.утро</code> / <code>.ночь</code> — показать приветствие сейчас (для проверки; обычно бот шлёт сам в 8:00 и 22:00 МСК)\n"
                 "<code>.добавитьгиф утро/ночь</code> (ответом на гифку) · <code>.гифы</code> · <code>.очиститьгифы утро/ночь</code> — копилка гифок для приветствий\n\n"
                 "<b>Опрос:</b> <code>.poll Вопрос? | вар1 | вар2</code>\n"
@@ -5494,7 +5772,8 @@ async def on_startup(app):
             from datetime import time as _dtime
             jq.run_daily(job_daily_report, time=_dtime(23, 59, tzinfo=MSK), name="daily_report")
             jq.run_daily(job_norm_reminder, time=_dtime(NORM_REMIND_HOUR, 0, tzinfo=MSK), name="norm_reminder")
-            print("[ОТЧЁТ] ежедневный отчёт запланирован на 23:59 МСК; напоминание о нормах — Сб 12:00", flush=True)
+            jq.run_daily(job_rank_scan, time=_dtime(RANK_SCAN_HOUR, 0, tzinfo=MSK), name="rank_scan")
+            print("[ОТЧЁТ] отчёт — 23:59; нормы-напоминание — Сб 12:00; скан рангов — 13:00 (МСК)", flush=True)
         except Exception as e:
             log_error("планировщик отчёта", e)
 
