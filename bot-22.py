@@ -171,6 +171,59 @@ ACHIEVEMENTS_BY_CODE = {a[0]: a for a in ACHIEVEMENTS}
 # Сезоны: топ активности за календарный месяц (МСК). В конце месяца топ-3 получают LP и попадают
 # в зал славы, счёт сезона обнуляется (новый месяц считается заново). {место: бонус_LP}.
 SEASON_REWARDS = {1: 200, 2: 120, 3: 60}
+# 6.0 Сезоны 2.0: чемпионы сезона получают особый престиж-титул в профиль (не только LP).
+SEASON_TITLES = {1: "🏆 Чемпион сезона", 2: "🥈 Призёр сезона", 3: "🥉 Призёр сезона"}
+SEASON_CHAMPION_TITLE_DAYS = 31   # сколько дней держится титул чемпиона (до конца следующего сезона)
+
+# ===== 6.0 «ИМПЕРИЯ»: ивент-модуль (временные множители LP, запускает владелец) =====
+EVENT_TYPES = {
+    "double":  ("🔥 Двойные LP", 2.0),
+    "triple":  ("⚡ Тройные LP", 3.0),
+    "happy":   ("🎉 Счастливый час", 2.0),
+}
+EVENT_MAX_HOURS = 72            # максимальная длительность ивента (часы)
+
+
+def event_active():
+    """Возвращает (название, множитель) активного ивента или (None, 1.0)."""
+    until = meta_get("event_until")
+    if not until:
+        return None, 1.0
+    try:
+        if datetime.fromisoformat(until) <= msk_now():
+            return None, 1.0
+    except Exception:
+        return None, 1.0
+    name = meta_get("event_name") or "Ивент"
+    try:
+        mult = float(meta_get("event_mult") or "1")
+    except Exception:
+        mult = 1.0
+    return name, mult
+
+
+def event_multiplier():
+    """Текущий множитель LP за сообщения (1.0 если ивента нет)."""
+    return event_active()[1]
+
+
+def event_status_text():
+    name, mult = event_active()
+    if not name:
+        return f"{pe('note')} Сейчас активных ивентов нет."
+    until = meta_get("event_until")
+    try:
+        left = datetime.fromisoformat(until) - msk_now()
+        hrs = int(left.total_seconds() // 3600)
+        mins = int((left.total_seconds() % 3600) // 60)
+        left_s = f"{hrs} ч {mins} мин" if hrs else f"{mins} мин"
+    except Exception:
+        left_s = "—"
+    return (f"{pe('mega')} <b>АКТИВЕН ИВЕНТ: {name}</b>\n{CLAN_LINE}\n"
+            f"{pe('lp')} Множитель LP за сообщения: <b>x{mult:g}</b>\n"
+            f"{pe('clock')} Осталось: <b>{left_s}</b>")
+
+
 
 # Анти-рейд: если за RAID_WINDOW секунд войдёт RAID_JOIN_COUNT+ человек — включается защита
 # на RAID_LOCKDOWN_MIN минут (новые входящие в это время получают мут до проверки админом).
@@ -193,6 +246,7 @@ GATED_COMMANDS = {
     "лотерея", "лото", "lottery", "дуэль", "дуель", "титул", "title",
     "квест", "quest", "задание", "ачивки", "achievements", "значки", "достижения",
     "викторина", "quiz", "квиз", "ответ", "answer",
+    "ивент", "event", "ивенты", "events",
 }
 
 # Управляющие команды владельца — работают только в личке с ботом (в группе не выполняются).
@@ -201,6 +255,8 @@ ADMIN_DM_COMMANDS = {
     "modlog", "log", "журнал", "analytics", "dashboard", "аналитика", "статклан",
     "checknorms", "проверканорм", "snapshotnorms", "снимокнорм", "месяцнормы", "monthnorms",
     "пранкменю", "prankmenu",
+    "отчётнеделя", "отчетнеделя", "weeklyreport", "недельныйотчет",
+    "отчётмесяц", "отчетмесяц", "monthlyreport", "месячныйотчет",
 }
 
 # 5.7: штабные команды, чьё сообщение бот удаляет сразу после вызова (чат остаётся чистым,
@@ -310,8 +366,8 @@ CITADEL_BONUS_LP = 150
 # Имя бота — всегда LINKOR BOSS. UPDATE_NAME — название большого обновления (5.x = «Цитадель»).
 # Версия (5.2) — это патч в рамках этого обновления.
 BOT_FULL_NAME = "LINKOR BOSS"
-BOT_VERSION = "5.9"
-PATCH_CODE = "LB-5.9"
+BOT_VERSION = "6.0"
+PATCH_CODE = "LB-6.0"
 UPDATE_NAME = "Цитадель"        # название большого обновления (вся ветка 5.x)
 PATCH_NAME = UPDATE_NAME        # для совместимости со старым кодом
 PATCH_TYPE = "обновление"
@@ -322,6 +378,11 @@ RELEASE_DATE = "13.06.2026"
 # История изменений ДЛЯ УЧАСТНИКОВ по версиям (новые сверху). Без админских/секретных команд.
 # Формат: (версия, тип, [пункты])
 CHANGELOG_HISTORY = [
+    ("6.0", "Империя", [
+        "🎉 Ивенты! Администрация может запускать особые события: <b>x2/x3 LP за сообщения</b> на время. Когда идёт ивент — самое время быть активным. Проверить: <code>.event</code>.",
+        "🏆 Сезоны 2.0: чемпионы месяца теперь получают не только LP, но и <b>титул-регалию в профиль</b> — 🏆 Чемпион / 🥈🥉 Призёр сезона на целый месяц. Борись за топ: <code>.season</code>.",
+        "✨ Финальное большое обновление Линкора — дальше только полировка и развитие.",
+    ]),
     ("5.9", "Регалии", [
         "👑 Титулы вместо роли: у участников в профиле вместо «Участник» теперь красуется заработанный титул. Качай престиж — выделяйся!",
         "❓ Викторина теперь на ТИТУЛЫ, а не LP: за победы открываются 🧠 Знаток (3), 📚 Эрудит (10), 🎓 Гений клана (25), 🏆 Чемпион викторин (50).",
@@ -2056,7 +2117,8 @@ async def show_season(update, context):
         marker = medals.get(i) or pe("star")
         lines.append(f"<b>{i+1}.</b> {marker} {esc(r['name'])} — <b>{r['val']}</b>")
     tail = (f"\n{pe('crown')} В конце сезона топ-3 получат LP "
-            f"(+{SEASON_REWARDS[1]} / +{SEASON_REWARDS[2]} / +{SEASON_REWARDS[3]}) и попадут в зал славы (<code>hof</code>).")
+            f"(+{SEASON_REWARDS[1]} / +{SEASON_REWARDS[2]} / +{SEASON_REWARDS[3]}), "
+            f"<b>титул-регалию в профиль</b> (🏆 Чемпион / 🥈🥉 Призёр) на месяц и место в зале славы (<code>hof</code>).")
     await update.message.reply_text(head + "\n".join(lines) + tail, parse_mode=ParseMode.HTML)
 
 
@@ -3196,6 +3258,17 @@ async def owner_command(update, context, first, parts):
     if first in ("пранкменю", "prankmenu"):
         await update.message.reply_text(prank_menu_text(), reply_markup=prank_menu_kb(), parse_mode=ParseMode.HTML)
         return True
+    if first in ("отчётнеделя", "отчетнеделя", "weeklyreport", "недельныйотчет"):
+        await update.message.reply_text(build_weekly_report(ALLOWED_CHAT_ID), parse_mode=ParseMode.HTML)
+        return True
+    if first in ("отчётмесяц", "отчетмесяц", "monthlyreport", "месячныйотчет"):
+        now = msk_now()
+        if any(p in ("текущий", "этот", "this") for p in parts[1:]):
+            mkey = now.strftime("%Y-%m")
+        else:
+            mkey = (now.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+        await update.message.reply_text(build_monthly_report(ALLOWED_CHAT_ID, mkey), parse_mode=ParseMode.HTML)
+        return True
     if first in ("backup", "бэкап", "бекап"):
         await send_backup(update, context); return True
     if first in ("modlog", "log", "журнал"):
@@ -3420,16 +3493,68 @@ async def private_router(update, context):
 # ============================================================
 #               ТРИГГЕРЫ (как в Iris)
 # ============================================================
+# 5.9: прокси для штабных команд — ответ ОТДЕЛЬНЫМ сообщением вместо реплая на (уже удалённую) команду.
+class _StandaloneMessage:
+    """Обёртка над Message: reply_text шлёт самостоятельное сообщение в чат (без цитаты). Остальное — как у оригинала."""
+    __slots__ = ("_real", "_bot", "_chat_id", "_thread")
+
+    def __init__(self, real_msg, bot, chat_id, thread):
+        object.__setattr__(self, "_real", real_msg)
+        object.__setattr__(self, "_bot", bot)
+        object.__setattr__(self, "_chat_id", chat_id)
+        object.__setattr__(self, "_thread", thread)
+
+    async def reply_text(self, text, **kwargs):
+        kwargs.pop("reply_to_message_id", None)
+        kwargs.pop("reply_to_message", None)
+        if self._thread and "message_thread_id" not in kwargs:
+            kwargs["message_thread_id"] = self._thread
+        return await self._bot.send_message(chat_id=self._chat_id, text=text, **kwargs)
+
+    # алиас на случай вызова reply_html и т.п. — направляем в standalone
+    async def reply_html(self, text, **kwargs):
+        kwargs["parse_mode"] = "HTML"
+        return await self.reply_text(text, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class _StandaloneUpdate:
+    """Обёртка над Update: подменяет message/effective_message на standalone-версию, остальное делегирует."""
+    __slots__ = ("_real", "_msg")
+
+    def __init__(self, real_update, bot, chat_id, thread):
+        object.__setattr__(self, "_real", real_update)
+        object.__setattr__(self, "_msg", _StandaloneMessage(real_update.message, bot, chat_id, thread))
+
+    @property
+    def message(self):
+        return self._msg
+
+    @property
+    def effective_message(self):
+        return self._msg
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+# ============================================================
 async def handle_triggers(update, context, text, low, parts):
     first = parts[0]
-    # 5.7: штабную команду в чате удаляем сразу — чат остаётся чистым, ответ бот даёт отдельно.
+    # 5.9: штабную команду удаляем СРАЗУ, а ответ бота шлём ОТДЕЛЬНЫМ сообщением (без цитаты на команду).
+    # Объекты PTB неизменяемы, поэтому оборачиваем update в лёгкий прокси, где reply_text → standalone send.
     if (first in STAFF_AUTODELETE_COMMANDS and update.effective_chat
             and update.effective_chat.type in ("group", "supergroup")
             and update.message and await can_use_admin(context, update.effective_user.id)):
+        _chat_id = update.effective_chat.id
+        _thread = getattr(update.message, "message_thread_id", None)
         try:
-            await update.message.delete()
+            await update.message.delete()        # удаляем команду мгновенно — никто её не видит
         except Exception:
             pass
+        update = _StandaloneUpdate(update, context.bot, _chat_id, _thread)
     # Управляющие команды владельца работают ВЕЗДЕ (и в чате, и в ЛС). Единый обработчик owner_command.
     if first in ADMIN_DM_COMMANDS:
         if await owner_command(update, context, first, parts):
@@ -3601,6 +3726,57 @@ async def handle_triggers(update, context, text, low, parts):
             f"Сумма за неделю: <b>{stat_week(cid, t.id)}</b> · сегодня: <b>{stat_today(cid, t.id)}</b>",
             parse_mode=ParseMode.HTML)
         return True
+    # ===== 6.0 «ИМПЕРИЯ»: ивенты =====
+    if first in ("ивент", "event", "ивенты", "events"):
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        # запуск/стоп — только владелец
+        if sub in EVENT_TYPES or sub in ("стоп", "stop", "off"):
+            if not is_owner(update.effective_user.id):
+                await update.message.reply_text(event_status_text(), parse_mode=ParseMode.HTML)
+                return True
+            if sub in ("стоп", "stop", "off"):
+                meta_set("event_until", "")
+                await update.message.reply_text(f"{pe('check')} Ивент остановлен.", parse_mode=ParseMode.HTML)
+                if ALLOWED_CHAT_ID:
+                    try:
+                        await context.bot.send_message(ALLOWED_CHAT_ID,
+                            f"{pe('note')} Ивент завершён администрацией. Спасибо за актив! 💙", parse_mode=ParseMode.HTML)
+                    except Exception:
+                        pass
+                return True
+            label, mult = EVENT_TYPES[sub]
+            hrs = next((int(p) for p in parts[2:] if p.isdigit()), 24)
+            hrs = max(1, min(EVENT_MAX_HOURS, hrs))
+            until = (msk_now() + timedelta(hours=hrs)).isoformat()
+            meta_set("event_until", until)
+            meta_set("event_name", label)
+            meta_set("event_mult", str(mult))
+            await update.message.reply_text(
+                f"{pe('check')} Запущен ивент <b>{label}</b> на <b>{hrs} ч</b> (x{mult:g} LP).", parse_mode=ParseMode.HTML)
+            if ALLOWED_CHAT_ID:
+                try:
+                    await context.bot.send_message(ALLOWED_CHAT_ID,
+                        f"{pe('mega')} <b>ИВЕНТ: {label}!</b>\n{CLAN_LINE}\n"
+                        f"{pe('lp')} LP за сообщения — <b>x{mult:g}</b> на ближайшие <b>{hrs} ч</b>!\n"
+                        f"Пишите, общайтесь, зарабатывайте больше! {pe('fire')}", parse_mode=ParseMode.HTML)
+                except Exception:
+                    pass
+            return True
+        # статус (всем)
+        if is_owner(update.effective_user.id) and sub in ("", "help", "помощь"):
+            await update.message.reply_text(
+                f"{pe('game')} <b>ИВЕНТ-МОДУЛЬ</b>\n{CLAN_LINE}\n"
+                f"{event_status_text()}\n\n"
+                f"<blockquote>Запуск (владелец):\n"
+                f"<code>.event double 24</code> — x2 LP на 24 ч\n"
+                f"<code>.event triple 6</code> — x3 LP на 6 ч\n"
+                f"<code>.event happy 2</code> — счастливый час\n"
+                f"<code>.event stop</code> — остановить</blockquote>",
+                parse_mode=ParseMode.HTML)
+            return True
+        await update.message.reply_text(event_status_text(), parse_mode=ParseMode.HTML)
+        return True
+
     # ===== 5.7 «КАЗНА» =====
     # ===== 5.9 РЕЖИМ ВЛАДЕЛЬЦА: пранки и прямые сеттеры =====
     if first in ("пранк", "prank"):
@@ -3756,8 +3932,10 @@ async def handle_triggers(update, context, text, low, parts):
         if me.id in EXCLUDED_IDS or me.id == LEADER_ID:
             await update.message.reply_text(f"{pe('note')} Квесты — для участников клана.", parse_mode=ParseMode.HTML)
             return True
+        # 5.9: если требование уже выполнено (дуэль сыграна, респект получен) — засчитываем прямо при просмотре
+        await try_complete_quest(context, cid, me.id, me.full_name)
         code, desc, goal = quest_of_day(cid, me.id)
-        base = code.rstrip("0123456789") if code.startswith("msg") else code
+        base = code.rstrip("0123456789") or code  # 5.9 ФИКС: обрезаем цифру у ВСЕХ кодов (duel1→duel, rep1→rep), иначе квесты не засчитывались
         # прогресс к следующему престиж-титулу
         total = quests_total(cid, me.id)
         nxt = next(((need, tt) for need, tt in QUEST_TITLES if total < need), None)
@@ -4883,7 +5061,7 @@ async def try_complete_quest(context, chat_id, user_id, name):
     if quest_claimed(chat_id, user_id):
         return
     code, desc, goal = quest_of_day(chat_id, user_id)
-    base = code.rstrip("0123456789") if code.startswith("msg") else code
+    base = code.rstrip("0123456789") or code  # 5.9 ФИКС: обрезаем цифру у ВСЕХ кодов (duel1→duel, rep1→rep), иначе квесты не засчитывались
     prog = quest_progress(chat_id, user_id, base)
     if prog < goal:
         return
@@ -5436,16 +5614,23 @@ async def maybe_finalize_season(context, chat_id):
                 conn.execute(
                     "INSERT INTO hall_of_fame (chat_id, season, rank, user_id, name, score, ts) VALUES (?,?,?,?,?,?,?)",
                     (chat_id, last, rank, r["user_id"], r["name"], int(r["val"]), now_iso))
-                if bonus and r["user_id"] not in EXCLUDED_IDS:
-                    add_lp(chat_id, r["user_id"], bonus)
-                lines.append(f"{medals[i]} <b>{esc(r['name'])}</b> — {r['val']} сообщ. (+{bonus} LP)")
+                if r["user_id"] not in EXCLUDED_IDS and r["user_id"] != LEADER_ID:
+                    if bonus:
+                        add_lp(chat_id, r["user_id"], bonus)
+                    # 6.0 Сезоны 2.0: вручаем престиж-титул чемпиона/призёра на ~месяц
+                    stitle = SEASON_TITLES.get(rank)
+                    if stitle:
+                        until = (msk_now() + timedelta(days=SEASON_CHAMPION_TITLE_DAYS)).strftime("%Y-%m-%d")
+                        conn.execute("UPDATE users SET title_text=?, title_until=? WHERE chat_id=? AND user_id=?",
+                                     (stitle, until, chat_id, r["user_id"]))
+                lines.append(f"{medals[i]} <b>{esc(r['name'])}</b> — {r['val']} сообщ. (+{bonus} LP · {SEASON_TITLES.get(i+1,'')})")
             conn.commit()
             try:
                 await context.bot.send_message(
                     chat_id,
                     f"{pe('cup')} <b>СЕЗОН «{season_title(last)}» ЗАВЕРШЁН — {CLAN_NAME}</b>\n{CLAN_LINE}\n\n"
                     f"{pe('crown')} <b>Победители сезона:</b>\n" + "\n".join(lines) + "\n\n"
-                    f"{pe('star')} Они занесены в зал славы (<code>hof</code>). Новый сезон «{season_title(cur)}» начался — "
+                    f"{pe('star')} Они занесены в зал славы (<code>hof</code>) и получили <b>титул-регалию в профиль</b> на месяц! Новый сезон «{season_title(cur)}» начался — "
                     f"топ обнулён, у всех равные шансы. Погнали! {pe('fire')}",
                     parse_mode=ParseMode.HTML)
             except Exception:
@@ -6471,7 +6656,7 @@ async def counter(update, context):
             _last_sender[chat_id] = [user.id, 1]
             ls = _last_sender[chat_id]
         if not is_cmd and stat_today(chat_id, user.id) <= MSG_DAILY_CAP and ls[1] <= SELF_SPAM_LIMIT:
-            add_lp(chat_id, user.id, LP_PER_MESSAGE)
+            add_lp(chat_id, user.id, round(LP_PER_MESSAGE * event_multiplier(), 3))   # 6.0: x2/x3 во время ивента
     except Exception:
         pass
     # Ежедневный стрик (чек-ин при первом сообщении за день)
@@ -6657,6 +6842,7 @@ def _help_section(key):
                 "• <code>.lottery</code> — купить билет и выиграть банк · <code>.duel</code> (ответом) — сразиться на LP\n"
                 "• <code>.title buy ТЕКСТ</code> — личный титул в профиле · <code>.title list</code> — витрина титулов\n"
                 "• <code>.quest</code> — задание дня (титулы!) · <code>.achievements</code> — твои значки · <code>.quiz</code> — вопрос с банком LP\n"
+                "• <code>.event</code> — активные ивенты клана (x2/x3 LP!)\n"
                 "• <code>.season</code> — топ сезона · <code>.hof</code> — зал славы</blockquote>")
     if key == "clan":
         return (f"{pe('shop')} <b>Клан</b>\n<blockquote expandable>"
@@ -6858,21 +7044,190 @@ async def clan_analytics(update, context):
         parse_mode=ParseMode.HTML)
 
 
-async def send_backup(update, context):
-    """Отправляет файл базы владельцу в ЛС (резервная копия перед деплоем)."""
-    if update.effective_user.id != LEADER_ID:
-        return await update.message.reply_text("Бэкап базы может делать только владелец клана.")
+async def _do_backup(context, note=""):
+    """6.0: ядро бэкапа — отправляет файл базы владельцу в ЛС. Используется командой и авто-джобой."""
     try:
         conn.execute("PRAGMA wal_checkpoint(FULL)")
         conn.commit()
     except Exception:
         pass
+    with open(DB_FILE, "rb") as f:
+        await context.bot.send_document(
+            LEADER_ID, document=f, filename=f"linkor_backup_{today_str()}.db",
+            caption=f"{pe('folder')} <b>Бэкап базы {CLAN_NAME}</b>\nДата: {today_str()}{note}",
+            parse_mode=ParseMode.HTML)
+
+
+async def job_auto_backup(context):
+    """6.0: авто-бэкап раз в неделю (понедельник 05:00). Тихо шлёт базу владельцу в ЛС."""
+    if msk_now().weekday() != 0:   # 0 = понедельник
+        return
+    wk = week_bounds()[0]
+    if meta_get("autobackup_week") == wk:
+        return
+    meta_set("autobackup_week", wk)
     try:
-        with open(DB_FILE, "rb") as f:
-            await context.bot.send_document(
-                LEADER_ID, document=f, filename=f"linkor_backup_{today_str()}.db",
-                caption=f"{pe('folder')} <b>Бэкап базы {CLAN_NAME}</b>\nДата: {today_str()}",
-                parse_mode=ParseMode.HTML)
+        await _do_backup(context, note="\n<i>Авто-бэкап (еженедельный)</i>")
+        print("[БЭКАП] авто-бэкап отправлен", flush=True)
+    except Exception as e:
+        log_error("авто-бэкап", e)
+
+
+def build_weekly_report(chat_id):
+    """6.0: компактный недельный отчёт владельцу — актив, прирост, экономика."""
+    mon, sun = week_bounds()
+    rows = conn.execute(
+        "SELECT user_id, name, username FROM users WHERE chat_id=? AND COALESCE(gone,0)=0", (chat_id,)).fetchall()
+    # топ активности за неделю
+    act = []
+    total_msgs = 0
+    for r in rows:
+        if r["user_id"] in EXCLUDED_IDS or r["user_id"] == LEADER_ID:
+            continue
+        w = stat_week(chat_id, r["user_id"])
+        total_msgs += w
+        if w > 0:
+            act.append((disp_name(r), w))
+    act.sort(key=lambda x: -x[1])
+    active_cnt = len(act)
+    # экономика за неделю (приход/расход LP по дневным потокам)
+    earn = spend = 0
+    d = mon
+    while d <= sun and d <= today_str():
+        try:
+            e, s = lp_day_flows(chat_id, d)
+            earn += e
+            spend += s
+        except Exception:
+            pass
+        d = (datetime.fromisoformat(d) + timedelta(days=1)).strftime("%Y-%m-%d") if False else \
+            (datetime.strptime(d, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+    lines = [f"{pe('stats')} <b>НЕДЕЛЬНЫЙ ОТЧЁТ {CLAN_NAME}</b>",
+             f"{CLAN_LINE}",
+             f"Период: {_fmt_day_human(mon)} — {_fmt_day_human(sun)}\n",
+             f"{pe('person')} Активных участников: <b>{active_cnt}</b>",
+             f"{pe('msg')} Сообщений за неделю: <b>{total_msgs}</b>"]
+    if act:
+        lines.append(f"\n{pe('cup')} <b>Топ активности:</b>")
+        for i, (nm, w) in enumerate(act[:10], 1):
+            medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"{i}.")
+            lines.append(f"{medal} {esc(nm)} — <b>{w}</b>")
+    lines.append(f"\n{pe('lp')} <b>Экономика недели:</b> приход +{int(earn)} LP · расход −{int(spend)} LP")
+    name, mult = event_active()
+    if name:
+        lines.append(f"{pe('mega')} Активен ивент: {name} (x{mult:g})")
+    return "\n".join(lines)
+
+
+async def job_weekly_report(context):
+    """6.0: недельный отчёт владельцу — воскресенье 22:30."""
+    if not ALLOWED_CHAT_ID:
+        return
+    if msk_now().weekday() != 6:   # 6 = воскресенье
+        return
+    wk = week_bounds()[0]
+    if meta_get("weekly_report_week") == wk:
+        return
+    meta_set("weekly_report_week", wk)
+    try:
+        await context.bot.send_message(LEADER_ID, build_weekly_report(ALLOWED_CHAT_ID), parse_mode=ParseMode.HTML)
+        print("[ОТЧЁТ] недельный отчёт отправлен", flush=True)
+    except Exception as e:
+        log_error("недельный отчёт", e)
+
+
+def build_monthly_report(chat_id, month_key):
+    """6.0: большой месячный отчёт владельцу — итоги месяца: актив, рост, экономика, нормы, чемпионы."""
+    rows = conn.execute(
+        "SELECT user_id, name, username, lp FROM users WHERE chat_id=? AND COALESCE(gone,0)=0", (chat_id,)).fetchall()
+    act = []
+    total_msgs = 0
+    for r in rows:
+        if r["user_id"] in EXCLUDED_IDS or r["user_id"] == LEADER_ID:
+            continue
+        m = conn.execute("SELECT COALESCE(SUM(cnt),0) AS c FROM stats WHERE chat_id=? AND user_id=? AND day LIKE ?",
+                         (chat_id, r["user_id"], month_key + "%")).fetchone()["c"]
+        total_msgs += m
+        if m > 0:
+            act.append((disp_name(r), m))
+    act.sort(key=lambda x: -x[1])
+    active_cnt = len(act)
+    # новые участники за месяц (по дате вступления joined)
+    try:
+        newcomers = conn.execute(
+            "SELECT COUNT(*) AS c FROM users WHERE chat_id=? AND COALESCE(gone,0)=0 AND joined LIKE ?",
+            (chat_id, month_key + "%")).fetchone()["c"]
+    except Exception:
+        newcomers = None
+    # экономика за месяц
+    earn = spend = 0
+    d = month_key + "-01"
+    last_day = today_str()
+    while d <= last_day and d.startswith(month_key):
+        try:
+            e, s = lp_day_flows(chat_id, d)
+            earn += e
+            spend += s
+        except Exception:
+            pass
+        d = (datetime.strptime(d, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+    # нормы: сколько недель закрыто по кубкам за месяц (из norm_weeks)
+    try:
+        cups_weeks = conn.execute(
+            "SELECT COALESCE(SUM(cups_ok),0) AS c FROM norm_weeks WHERE chat_id=? AND week LIKE ?",
+            (chat_id, month_key + "%")).fetchone()["c"]
+    except Exception:
+        cups_weeks = 0
+    # чемпионы прошлого сезона (из зала славы)
+    champs = conn.execute(
+        "SELECT rank, name, score FROM hall_of_fame WHERE chat_id=? AND season=? ORDER BY rank ASC LIMIT 3",
+        (chat_id, month_key)).fetchall()
+
+    lines = [f"{pe('stats')} <b>МЕСЯЧНЫЙ ОТЧЁТ {CLAN_NAME} — {season_title(month_key)}</b>",
+             f"{CLAN_LINE}",
+             f"{pe('person')} Активных участников за месяц: <b>{active_cnt}</b>",
+             f"{pe('msg')} Всего сообщений: <b>{total_msgs}</b>"]
+    if newcomers is not None:
+        lines.append(f"{pe('star')} Новичков пришло: <b>{newcomers}</b>")
+    lines.append(f"{pe('cup')} Норм по кубкам закрыто (недель суммарно): <b>{cups_weeks}</b>")
+    lines.append(f"\n{pe('lp')} <b>Экономика месяца:</b> приход +{int(earn)} LP · расход −{int(spend)} LP")
+    if act:
+        lines.append(f"\n{pe('crown')} <b>Топ активности месяца:</b>")
+        for i, (nm, m) in enumerate(act[:10], 1):
+            medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(i, f"{i}.")
+            lines.append(f"{medal} {esc(nm)} — <b>{m}</b>")
+    if champs:
+        lines.append(f"\n{pe('cup')} <b>Чемпионы сезона (зал славы):</b>")
+        for c in champs:
+            md = {1: "🥇", 2: "🥈", 3: "🥉"}.get(c["rank"], "•")
+            lines.append(f"{md} {esc(c['name'])} — {c['score']} сообщ.")
+    return "\n".join(lines)
+
+
+async def job_monthly_report(context):
+    """6.0: большой месячный отчёт владельцу — 1-го числа за прошлый месяц."""
+    if not ALLOWED_CHAT_ID:
+        return
+    now = msk_now()
+    if now.day != 1:
+        return
+    prev = (now.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+    if meta_get(f"monthly_report_{prev}"):
+        return
+    meta_set(f"monthly_report_{prev}", "1")
+    try:
+        await context.bot.send_message(LEADER_ID, build_monthly_report(ALLOWED_CHAT_ID, prev), parse_mode=ParseMode.HTML)
+        print("[ОТЧЁТ] месячный отчёт отправлен", flush=True)
+    except Exception as e:
+        log_error("месячный отчёт", e)
+
+
+async def send_backup(update, context):
+    """Отправляет файл базы владельцу в ЛС (резервная копия перед деплоем)."""
+    if update.effective_user.id != LEADER_ID:
+        return await update.message.reply_text("Бэкап базы может делать только владелец клана.")
+    try:
+        await _do_backup(context)
         await update.message.reply_text(
             f"{pe('check')} <b>Бэкап готов.</b> Файл базы отправлен тебе в личку.", parse_mode=ParseMode.HTML)
     except Exception as e:
@@ -7167,6 +7522,9 @@ async def on_startup(app):
             jq.run_daily(job_daily_report, time=_dtime(23, 59, tzinfo=MSK), name="daily_report")
             jq.run_daily(job_norm_reminder, time=_dtime(NORM_REMIND_HOUR, 0, tzinfo=MSK), name="norm_reminder")
             jq.run_daily(job_rank_scan, time=_dtime(RANK_SCAN_HOUR, 0, tzinfo=MSK), name="rank_scan")
+            jq.run_daily(job_auto_backup, time=_dtime(5, 0, tzinfo=MSK), name="auto_backup")          # 6.0: пн авто-бэкап
+            jq.run_daily(job_weekly_report, time=_dtime(22, 30, tzinfo=MSK), name="weekly_report")    # 6.0: вс недельный отчёт
+            jq.run_daily(job_monthly_report, time=_dtime(9, 0, tzinfo=MSK), name="monthly_report")    # 6.0: 1-го месячный отчёт
             print("[ОТЧЁТ] отчёт — 23:59; нормы-напоминание — Сб 12:00; скан рангов — 13:00 (МСК)", flush=True)
         except Exception as e:
             log_error("планировщик отчёта", e)
