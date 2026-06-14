@@ -95,8 +95,8 @@ MAX_WARNS = 3
 LP_MAX = 10000                     # потолок LP (правила STORE)
 LP_MIN = -10000                    # минимальный баланс (штрафы могут уводить в минус)
 LP_WEEKLY_CAP = 150                # 5.7: недельный лимит наград за нормы (кубки/ранг/квесты/викторина — общий пул)
-LP_PER_MESSAGE = 0.02              # 5.8: LP за сообщение. 0.05→0.03→0.02 — главный faucet прижат к бюджету
-MSG_DAILY_CAP = 600                # 5.8: макс. сообщений в день, дающих LP. 1500→700→600 → потолок ~12 LP/день
+LP_PER_MESSAGE = 0.02              # 6.0: LP за сообщение (надёжная база активности)
+MSG_DAILY_CAP = 500                # 6.0: макс. сообщений/день с LP. 600→500 (анти-спам) → потолок 10 LP/день
 SELF_SPAM_LIMIT = 8                # 5.7: сообщений подряд без ответа других, ещё дающих LP. Было 10
 WEEKLY_MSG_NORM = 450              # клановая норма сообщений/нед (для регламента)
 SUPER_NORM_MSGS = 1250             # порог «сверх-активности» (только для отметки в нормах)
@@ -247,6 +247,7 @@ GATED_COMMANDS = {
     "квест", "quest", "задание", "ачивки", "achievements", "значки", "достижения",
     "викторина", "quiz", "квиз", "ответ", "answer",
     "ивент", "event", "ивенты", "events",
+    "карточка", "card", "карта",
 }
 
 # Управляющие команды владельца — работают только в личке с ботом (в группе не выполняются).
@@ -257,6 +258,7 @@ ADMIN_DM_COMMANDS = {
     "пранкменю", "prankmenu",
     "отчётнеделя", "отчетнеделя", "weeklyreport", "недельныйотчет",
     "отчётмесяц", "отчетмесяц", "monthlyreport", "месячныйотчет",
+    "дайджест", "digest", "сводка",
 }
 
 # 5.7: штабные команды, чьё сообщение бот удаляет сразу после вызова (чат остаётся чистым,
@@ -349,7 +351,8 @@ STORE_MANAGER = "@VoxTecn"
 # --- Награды за игровые нормы (начисляет только админ секретными командами) ---
 NORM_RANK_LP = 70              # норма ранга (Легендарный) — было 220
 NORM_TROPHY_LP = 70            # норма кубков — было 200; теперь копится и выдаётся раз в МЕСЯЦ (за каждую закрытую неделю)
-NORM_MONTH_PER_WEEK = 70       # 5.8: LP за каждую неделю месяца, где норма кубков была закрыта (месячная выплата)
+NORM_MONTH_PER_WEEK = 95       # 6.0: LP за каждую закрытую неделю нормы кубков (главный стабильный доход; платится помесячно)
+NORM_MSG_WEEK_LP = 35          # 6.0: LP за закрытую норму СООБЩЕНИЙ за неделю (стабильный доход для всех активных, платится помесячно)
 
 # --- Система норм-кубков (Этап 5) ---
 WEEKLY_TROPHY_NORM = 1450      # сколько кубков надо набрать за неделю (Пн→Вс МСК)
@@ -381,6 +384,9 @@ CHANGELOG_HISTORY = [
     ("6.0", "Империя", [
         "🎉 Ивенты! Администрация может запускать особые события: <b>x2/x3 LP за сообщения</b> на время. Когда идёт ивент — самое время быть активным. Проверить: <code>.event</code>.",
         "🏆 Сезоны 2.0: чемпионы месяца теперь получают не только LP, но и <b>титул-регалию в профиль</b> — 🏆 Чемпион / 🥈🥉 Призёр сезона на целый месяц. Борись за топ: <code>.season</code>.",
+        "💰 Экономика обновлена: теперь LP дают ОБЕ нормы — за кубки (95/нед) и за сообщения (35/нед), выплата 1-го числа за каждую закрытую неделю. Закрывай нормы — двигайся к призам заметно быстрее. Активность важна как никогда!",
+        "🖼️ Карточка профиля картинкой: <code>.card</code> — красивая карточка в фирменном тёмно-золотом стиле клана с твоими статами, титулом и рангом. Можно сохранить и показать!",
+        "✨ Профиль 2.0: добавлены место в текущем сезоне, прогресс квестов и побед в викторине.",
         "✨ Финальное большое обновление Линкора — дальше только полировка и развитие.",
     ]),
     ("5.9", "Регалии", [
@@ -1897,6 +1903,87 @@ async def act_kick(update, context, t):
 # ============================================================
 #                   ПРОФИЛЬ / LP / РЕПУТАЦИЯ / ТОП
 # ============================================================
+def _card_font(size, bold=False):
+    """6.0: шрифт для карточки с фолбэками (DejaVu поддерживает кириллицу). Если нет — дефолтный PIL."""
+    from PIL import ImageFont
+    paths = ([
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ] if bold else [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    ])
+    for p in paths:
+        try:
+            return ImageFont.truetype(p, size)
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default()
+    except Exception:
+        return None
+
+
+def render_profile_card(chat_id, user_id, display_name):
+    """6.0: рисует карточку профиля (тёмно-золотой стиль клана) и возвращает BytesIO PNG. None при сбое."""
+    try:
+        from PIL import Image, ImageDraw
+        import io
+        row = get_user(chat_id, user_id)
+        if not row:
+            return None
+        W, H = 900, 520
+        bg = (16, 18, 24)
+        gold = (212, 175, 55)
+        white = (235, 238, 245)
+        grey = (150, 156, 168)
+        img = Image.new("RGB", (W, H), bg)
+        d = ImageDraw.Draw(img)
+        # рамка-золото
+        d.rectangle([6, 6, W - 7, H - 7], outline=gold, width=3)
+        d.rectangle([14, 14, W - 15, H - 15], outline=(60, 55, 30), width=1)
+        # шапка
+        d.text((40, 34), CLAN_NAME.upper(), font=_card_font(34, True), fill=gold)
+        d.text((40, 80), "ПРОФИЛЬ УЧАСТНИКА", font=_card_font(18, False), fill=grey)
+        d.line([40, 116, W - 40, 116], fill=(60, 55, 30), width=2)
+        # имя + титул
+        d.text((40, 134), display_name[:26], font=_card_font(40, True), fill=white)
+        et = active_title(row) or (row["earned_title"] if "earned_title" in row.keys() else None)
+        if et:
+            d.text((42, 188), str(et)[:34], font=_card_font(22, False), fill=gold)
+        # статы — две колонки
+        lp = row["lp"]
+        rep = row["reputation"] or 0
+        streak = row["streak"] or 0
+        total = stat_total(chat_id, user_id)
+        rb = row["rank_best"] if "rank_best" in row.keys() else None
+        rankname = rank_name(rb) if rb else "—"
+        y0 = 248
+        col1 = [("LP (баланс)", fmt_lp(lp)), ("Репутация", str(rep)), ("Серия дней", str(streak))]
+        col2 = [("Сообщений", str(total)), ("Ранг", rankname), ("Квестов", str(quests_total(chat_id, user_id)))]
+        for i, (label, val) in enumerate(col1):
+            yy = y0 + i * 70
+            d.text((48, yy), label, font=_card_font(18, False), fill=grey)
+            d.text((48, yy + 24), val, font=_card_font(30, True), fill=white)
+        for i, (label, val) in enumerate(col2):
+            yy = y0 + i * 70
+            d.text((480, yy), label, font=_card_font(18, False), fill=grey)
+            d.text((480, yy + 24), val, font=_card_font(30, True), fill=white)
+        # разделитель колонок
+        d.line([450, y0, 450, y0 + 200], fill=(60, 55, 30), width=1)
+        # подвал
+        d.text((40, H - 52), f"{CLAN_LINE}", font=_card_font(16, False), fill=grey)
+        d.text((W - 230, H - 52), today_str(), font=_card_font(16, False), fill=grey)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        buf.name = "profile_card.png"
+        return buf
+    except Exception as e:
+        log_error("карточка профиля", e)
+        return None
+
+
 async def show_profile(update, context, user):
     chat_id = update.effective_chat.id
     ensure_user(chat_id, user)
@@ -1949,6 +2036,20 @@ async def show_profile(update, context, user):
     if _badges:
         icons = " ".join(ACHIEVEMENTS_BY_CODE[c][1] for c in _badges if c in ACHIEVEMENTS_BY_CODE)
         text += f"\n{pe('star')} Значки: {icons}"
+    # 6.0 Профиль 2.0: место в текущем сезоне + прогресс титулов (квесты/викторина)
+    if user.id not in EXCLUDED_IDS and disp_rank is None:
+        try:
+            srows = [r for r in season_top(chat_id, current_season(), 50) if r["val"] > 0]
+            pos = next((i + 1 for i, r in enumerate(srows) if r["user_id"] == user.id), None)
+            if pos:
+                medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(pos, f"#{pos}")
+                text += f"\n{pe('cup')} Место в сезоне: <b>{medal}</b> из {len(srows)}"
+        except Exception:
+            pass
+        qd = quests_total(chat_id, user.id)
+        qw = quiz_wins_total(chat_id, user.id)
+        if qd or qw:
+            text += f"\n{pe('game')} Квестов: <b>{qd}</b> · Побед в викторине: <b>{qw}</b>"
     # прогресс до награды — всем, кто в экономике (кроме «замороженных» админов)
     if user.id not in EXCLUDED_IDS:
         text += f"\n\n<blockquote>{progress_line(row['lp'])}</blockquote>"
@@ -3269,6 +3370,30 @@ async def owner_command(update, context, first, parts):
             mkey = (now.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
         await update.message.reply_text(build_monthly_report(ALLOWED_CHAT_ID, mkey), parse_mode=ParseMode.HTML)
         return True
+    if first in ("дайджест", "digest", "сводка"):
+        left = ai_cooldown_left(update.effective_user.id)
+        # отдельный КД дайджеста через meta
+        last = meta_get("digest_last_ts")
+        if last:
+            try:
+                mins = (msk_now() - datetime.fromisoformat(last)).total_seconds() / 60
+                if mins < DIGEST_COOLDOWN_MIN:
+                    await update.message.reply_text(
+                        f"{pe('clock')} Дайджест недавно делался. Следующий через <b>{int(DIGEST_COOLDOWN_MIN - mins) + 1} мин</b>.",
+                        parse_mode=ParseMode.HTML)
+                    return True
+            except Exception:
+                pass
+        await update.message.reply_text(f"{pe('clock')} Собираю дайджест тем чата…", parse_mode=ParseMode.HTML)
+        text, err = await build_ai_digest()
+        if err:
+            await update.message.reply_text(f"{pe('note')} {err}", parse_mode=ParseMode.HTML)
+            return True
+        meta_set("digest_last_ts", msk_now().isoformat())
+        await update.message.reply_text(
+            f"{pe('stats')} <b>AI-ДАЙДЖЕСТ ЧАТА</b>\n{CLAN_LINE}\n{text}\n\n"
+            f"<i>🔒 Приватность: только темы, без имён и цитат.</i>", parse_mode=ParseMode.HTML)
+        return True
     if first in ("backup", "бэкап", "бекап"):
         await send_backup(update, context); return True
     if first in ("modlog", "log", "журнал"):
@@ -3578,6 +3703,29 @@ async def handle_triggers(update, context, text, low, parts):
             await update.message.reply_text("Не нашёл такого участника. Он должен был хотя бы раз написать в чат после запуска бота.")
         else:
             await show_profile(update, context, rt)
+        return True
+    if first in ("карточка", "card", "карта"):
+        cid = ALLOWED_CHAT_ID if update.effective_chat.type == "private" else update.effective_chat.id
+        tgt = update.effective_user
+        rt = await read_target(update, context, parts)
+        if rt not in (False, None):
+            tgt = rt
+        ensure_user(cid, tgt)
+        await context.bot.send_chat_action(update.effective_chat.id, "upload_photo")
+        buf = render_profile_card(cid, tgt.id, tgt.full_name)
+        if buf is None:
+            await update.message.reply_text(
+                f"{pe('note')} Не удалось сделать карточку (рендер недоступен). Открой текстовый профиль: <code>.p</code>",
+                parse_mode=ParseMode.HTML)
+            return True
+        try:
+            await context.bot.send_photo(
+                update.effective_chat.id, photo=buf,
+                caption=f"{pe('person')} Карточка <b>{esc(tgt.full_name)}</b> · {CLAN_NAME}",
+                parse_mode=ParseMode.HTML)
+        except Exception as e:
+            log_error("отправка карточки", e)
+            await update.message.reply_text(f"{pe('cross')} Не удалось отправить карточку.", parse_mode=ParseMode.HTML)
         return True
     if first in ("топдень", "деньтоп", "topday", "daytop", "dailytop") or \
        (first in ("top", "топ") and len(parts) > 1 and parts[1] in ("день", "дня", "сутки", "day", "daily", "today")):
@@ -4823,6 +4971,46 @@ async def handle_triggers(update, context, text, low, parts):
 #                   AI (DeepSeek)
 # ============================================================
 _ai_cooldown = {}                 # user_id -> время последнего AI-запроса
+
+# ===== 6.0 «ИМПЕРИЯ»: AI-дайджест чата (строгая приватность) =====
+from collections import deque
+_digest_buffer = deque(maxlen=400)   # последние тексты сообщений (только текст, БЕЗ имён/id, в памяти, не в БД)
+DIGEST_MIN_MESSAGES = 25             # минимум сообщений, чтобы было что обобщать
+DIGEST_COOLDOWN_MIN = 120            # пауза между дайджестами
+
+
+def digest_feed(text):
+    """6.0: кладёт текст сообщения в приватный буфер для дайджеста (без авторства). Короткие/команды пропускаем."""
+    if not text:
+        return
+    t = text.strip()
+    if len(t) < 3 or t.startswith((CMD_PREFIX, "/")):
+        return
+    _digest_buffer.append(t[:300])
+
+
+async def build_ai_digest():
+    """6.0: просит AI выдать ТОЛЬКО темы обсуждений за период. Строгая приватность:
+    в модель уходит лишь обезличенный текст, а в промпте — запрет на имена и цитаты."""
+    if len(_digest_buffer) < DIGEST_MIN_MESSAGES:
+        return None, f"Пока маловато сообщений для дайджеста (нужно от {DIGEST_MIN_MESSAGES})."
+    corpus = "\n".join(list(_digest_buffer)[-300:])
+    system = (
+        "Ты — аналитик чата игрового клана. Сделай КРАТКУЮ сводку ТЕМ обсуждений по сообщениям. "
+        "СТРОГИЕ ПРАВИЛА ПРИВАТНОСТИ: НИКОГДА не указывай имена, ники, @упоминания. "
+        "НИКОГДА не цитируй сообщения дословно. Не пересказывай личные данные. "
+        "Только обобщённые ТЕМЫ и общее настроение. Формат: 4-7 коротких пунктов, каждый с эмодзи, "
+        "по-русски, дружелюбно. В конце — одна строка про общее настроение чата."
+    )
+    user = f"Сообщения чата (обезличенные):\n{corpus}\n\nДай сводку тем (без имён и цитат):"
+    out = await ai_complete(system, user, max_tokens=450, temperature=0.5)
+    if not out:
+        return None, "AI недоступен (проверь ключ/сеть)."
+    # подчистка: на всякий случай режем @упоминания, если модель их вставила
+    out = re.sub(r"@\w+", "участник", out)
+    return out, None
+
+
 _chat_buffer = {}                 # chat_id -> список последних сообщений [(имя, текст)]
 
 # ===== 5.7 «КАЗНА»: состояние дуэлей в памяти =====
@@ -5681,12 +5869,14 @@ async def norms_status_text(chat_id, user_id, name):
                              + (f"{pe('check')} неделя зачтена!"
                                 if gain >= WEEKLY_TROPHY_NORM else f"· осталось <b>{cup_left}</b>"))
                 lines.append(f"<i>снимок {meta_get('trophy_snapshot_ts') or '—'}: было {row['trophy_base']} → сейчас {cur}</i>")
-                # 5.8: сколько недель уже закрыто в этом месяце → будущая выплата
+                # 6.0: сколько недель закрыто в этом месяце (кубки + сообщения) → будущая выплата
                 mkey = today_str()[:7]
-                wk_ok = conn.execute("SELECT COALESCE(SUM(cups_ok),0) AS c FROM norm_weeks WHERE chat_id=? AND user_id=? AND week LIKE ?",
-                                     (chat_id, user_id, mkey + "%")).fetchone()["c"]
-                lines.append(f"{pe('lp')} В этом месяце закрыто недель: <b>{wk_ok}</b> → к выплате <b>{wk_ok * NORM_MONTH_PER_WEEK} LP</b> "
-                             f"<i>(1-го числа, {NORM_MONTH_PER_WEEK} LP/нед)</i>")
+                _wkrow = conn.execute("SELECT COALESCE(SUM(cups_ok),0) AS c, COALESCE(SUM(msg_ok),0) AS m FROM norm_weeks WHERE chat_id=? AND user_id=? AND week LIKE ?",
+                                      (chat_id, user_id, mkey + "%")).fetchone()
+                wk_ok = _wkrow["c"]; wk_msg = _wkrow["m"]
+                payout = wk_ok * NORM_MONTH_PER_WEEK + wk_msg * NORM_MSG_WEEK_LP
+                lines.append(f"{pe('lp')} В этом месяце: кубки ×{wk_ok}, сообщения ×{wk_msg} → к выплате <b>{payout} LP</b> "
+                             f"<i>(1-го числа · кубки {NORM_MONTH_PER_WEEK}/нед, сообщ {NORM_MSG_WEEK_LP}/нед)</i>")
         else:
             lines.append(f"{pe('cup')} Кубки: <i>точки отсчёта этой недели ещё нет — появится сама (понедельник или дневной скан в 13:00), либо привяжи тег командой <code>.tag</code></i>")
     else:
@@ -6510,23 +6700,24 @@ async def run_monthly_norms(context, chat_id, month_key):
     кубков, и выдаём LP пропорционально (NORM_MONTH_PER_WEEK за неделю). Прокрастинаторы, отыгравшие
     лишь последнюю неделю, получают только за неё — схитрить нельзя. Недели определяются по их понедельнику."""
     rows = conn.execute(
-        "SELECT user_id, SUM(cups_ok) AS cw, COUNT(*) AS wk FROM norm_weeks "
-        "WHERE chat_id=? AND week LIKE ? GROUP BY user_id HAVING cw > 0",
+        "SELECT user_id, SUM(cups_ok) AS cw, SUM(msg_ok) AS mw, COUNT(*) AS wk FROM norm_weeks "
+        "WHERE chat_id=? AND week LIKE ? GROUP BY user_id HAVING cw > 0 OR mw > 0",
         (chat_id, month_key + "%")).fetchall()
     paid = []
     for r in rows:
         uid = r["user_id"]
         if uid in EXCLUDED_IDS or uid == LEADER_ID:
             continue
-        weeks_ok = int(r["cw"] or 0)
-        amount = weeks_ok * NORM_MONTH_PER_WEEK
+        weeks_cups = int(r["cw"] or 0)
+        weeks_msg = int(r["mw"] or 0)
+        amount = weeks_cups * NORM_MONTH_PER_WEEK + weeks_msg * NORM_MSG_WEEK_LP   # 6.0: + норма сообщений
         if amount <= 0:
             continue
         add_lp(chat_id, uid, amount)
         urow = get_user(chat_id, uid)
         nm = disp_name(urow) if urow else str(uid)
-        paid.append((nm, weeks_ok, amount))
-    paid.sort(key=lambda x: -x[2])
+        paid.append((nm, weeks_cups, weeks_msg, amount))
+    paid.sort(key=lambda x: -x[3])
     # красивый месячный отчёт
     ym = month_key.split("-")
     month_names = ["", "январь", "февраль", "март", "апрель", "май", "июнь",
@@ -6534,10 +6725,15 @@ async def run_monthly_norms(context, chat_id, month_key):
     mname = month_names[int(ym[1])] if len(ym) == 2 and ym[1].isdigit() else month_key
     if paid:
         lines = [f"{pe('cup')} <b>БОЛЬШАЯ ПРОВЕРКА НОРМ — ИТОГИ МЕСЯЦА ({mname.upper()})</b>\n{CLAN_LINE}",
-                 f"{pe('lp')} Награда за кубки: <b>{NORM_MONTH_PER_WEEK} LP</b> за каждую закрытую неделю.\n"]
-        for nm, wk, amt in paid[:30]:
-            lines.append(f"{pe('check')} <b>{esc(nm)}</b> — недель закрыто: <b>{wk}</b> → <b>+{amt} LP</b>")
-        total = sum(a for _n, _w, a in paid)
+                 f"{pe('lp')} Кубки: <b>{NORM_MONTH_PER_WEEK} LP</b>/нед · Сообщения: <b>{NORM_MSG_WEEK_LP} LP</b>/нед (за каждую закрытую неделю).\n"]
+        for nm, wc, wm, amt in paid[:30]:
+            detail = []
+            if wc:
+                detail.append(f"кубки×{wc}")
+            if wm:
+                detail.append(f"сообщ×{wm}")
+            lines.append(f"{pe('check')} <b>{esc(nm)}</b> — {', '.join(detail)} → <b>+{amt} LP</b>")
+        total = sum(a for _n, _wc, _wm, a in paid)
         lines.append(f"\n{pe('star')} Всего выдано: <b>{total} LP</b> · отличная дисциплина, {CLAN_NAME}!")
         try:
             await context.bot.send_message(chat_id, "\n".join(lines), parse_mode=ParseMode.HTML)
@@ -6657,6 +6853,12 @@ async def counter(update, context):
             ls = _last_sender[chat_id]
         if not is_cmd and stat_today(chat_id, user.id) <= MSG_DAILY_CAP and ls[1] <= SELF_SPAM_LIMIT:
             add_lp(chat_id, user.id, round(LP_PER_MESSAGE * event_multiplier(), 3))   # 6.0: x2/x3 во время ивента
+    except Exception:
+        pass
+    # 6.0: приватный фид для AI-дайджеста (только текст, без авторства)
+    try:
+        if not is_cmd and update.message.text:
+            digest_feed(update.message.text)
     except Exception:
         pass
     # Ежедневный стрик (чек-ин при первом сообщении за день)
@@ -6843,6 +7045,7 @@ def _help_section(key):
                 "• <code>.title buy ТЕКСТ</code> — личный титул в профиле · <code>.title list</code> — витрина титулов\n"
                 "• <code>.quest</code> — задание дня (титулы!) · <code>.achievements</code> — твои значки · <code>.quiz</code> — вопрос с банком LP\n"
                 "• <code>.event</code> — активные ивенты клана (x2/x3 LP!)\n"
+                "• <code>.card</code> — твоя карточка профиля картинкой 🖼️\n"
                 "• <code>.season</code> — топ сезона · <code>.hof</code> — зал славы</blockquote>")
     if key == "clan":
         return (f"{pe('shop')} <b>Клан</b>\n<blockquote expandable>"
