@@ -1903,25 +1903,89 @@ async def act_kick(update, context, t):
 # ============================================================
 #                   ПРОФИЛЬ / LP / РЕПУТАЦИЯ / ТОП
 # ============================================================
-def _card_font(size, bold=False):
-    """6.0: шрифт для карточки с фолбэками (DejaVu поддерживает кириллицу). Если нет — дефолтный PIL."""
-    from PIL import ImageFont
-    paths = ([
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-    ] if bold else [
+_CARD_CYR_FONT = None        # путь к найденному шрифту с кириллицей (или None)
+_CARD_FONT_CHECKED = False
+
+_TRANSLIT = {
+    'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e', 'ж': 'zh',
+    'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm', 'н': 'n', 'о': 'o',
+    'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u', 'ф': 'f', 'х': 'h', 'ц': 'ts',
+    'ч': 'ch', 'ш': 'sh', 'щ': 'sch', 'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya',
+}
+
+
+def _translit(s):
+    """Кириллица → латиница (для карты, если на хосте нет русского шрифта)."""
+    out = []
+    for ch in (s or ""):
+        low = ch.lower()
+        if low in _TRANSLIT:
+            r = _TRANSLIT[low]
+            out.append(r.upper() if ch.isupper() else r)
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _find_cyr_font():
+    """Ищет TTF с кириллицей: рядом с ботом, затем в системе. Кэширует путь. None если не найден."""
+    global _CARD_CYR_FONT, _CARD_FONT_CHECKED
+    if _CARD_FONT_CHECKED:
+        return _CARD_CYR_FONT
+    _CARD_FONT_CHECKED = True
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, "DejaVuSans.ttf"), os.path.join(here, "font.ttf"),
+        os.path.join(here, "arial.ttf"), os.path.join(here, "Roboto-Regular.ttf"),
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    ])
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+    ]
+    from PIL import ImageFont
+    for p in candidates:
+        try:
+            if os.path.exists(p):
+                f = ImageFont.truetype(p, 24)
+                # проверяем, что в шрифте есть кириллица (буква «А»)
+                if f.getmask("А").getbbox() is not None:
+                    _CARD_CYR_FONT = p
+                    return p
+        except Exception:
+            continue
+    return None
+
+
+def _card_font(size, bold=False):
+    """Шрифт для карты. Если есть кириллический TTF — берём его (и Bold-вариант рядом), иначе дефолт PIL."""
+    from PIL import ImageFont
+    base = _find_cyr_font()
+    if base:
+        path = base
+        if bold:
+            cand = base.replace("DejaVuSans.ttf", "DejaVuSans-Bold.ttf").replace("-Regular", "-Bold").replace("FreeSans", "FreeSansBold")
+            if os.path.exists(cand):
+                path = cand
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            pass
+    # система: классические жирные пути
+    paths = (["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"] if bold
+             else ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"])
     for p in paths:
         try:
             return ImageFont.truetype(p, size)
         except Exception:
             continue
     try:
-        return ImageFont.load_default()
+        return ImageFont.load_default(size)
     except Exception:
-        return None
+        return ImageFont.load_default()
+
+
+def _ct(s):
+    """Текст для карты: оставляем кириллицу если шрифт её поддерживает, иначе транслитерируем."""
+    return s if _find_cyr_font() else _translit(s)
 
 
 def render_profile_card(chat_id, user_id, display_name):
@@ -1943,37 +2007,40 @@ def render_profile_card(chat_id, user_id, display_name):
         d.rectangle([6, 6, W - 7, H - 7], outline=gold, width=3)
         d.rectangle([14, 14, W - 15, H - 15], outline=(60, 55, 30), width=1)
         # шапка
-        d.text((40, 34), CLAN_NAME.upper(), font=_card_font(34, True), fill=gold)
-        d.text((40, 80), "ПРОФИЛЬ УЧАСТНИКА", font=_card_font(18, False), fill=grey)
+        d.text((40, 32), CLAN_NAME.upper(), font=_card_font(36, True), fill=gold)
+        d.text((42, 82), "PROFILE CARD", font=_card_font(17, False), fill=grey)
         d.line([40, 116, W - 40, 116], fill=(60, 55, 30), width=2)
-        # имя + титул
-        d.text((40, 134), display_name[:26], font=_card_font(40, True), fill=white)
+        # имя + титул (транслит если нет кириллического шрифта)
+        d.text((40, 132), _ct(display_name)[:26], font=_card_font(40, True), fill=white)
         et = active_title(row) or (row["earned_title"] if "earned_title" in row.keys() else None)
         if et:
-            d.text((42, 188), str(et)[:34], font=_card_font(22, False), fill=gold)
+            # на карте эмодзи может не отрисоваться дефолтным шрифтом — чистим до букв/цифр
+            et_clean = _ct(re.sub(r"[^\w\s\-!?.]", "", str(et), flags=re.UNICODE)).strip()
+            if et_clean:
+                d.text((42, 188), et_clean[:34], font=_card_font(22, False), fill=gold)
         # статы — две колонки
         lp = row["lp"]
         rep = row["reputation"] or 0
         streak = row["streak"] or 0
         total = stat_total(chat_id, user_id)
         rb = row["rank_best"] if "rank_best" in row.keys() else None
-        rankname = rank_name(rb) if rb else "—"
-        y0 = 248
-        col1 = [("LP (баланс)", fmt_lp(lp)), ("Репутация", str(rep)), ("Серия дней", str(streak))]
-        col2 = [("Сообщений", str(total)), ("Ранг", rankname), ("Квестов", str(quests_total(chat_id, user_id)))]
+        rankname = _ct(rank_name(rb)) if rb else "—"
+        y0 = 244
+        col1 = [("LP BALANCE", fmt_lp(lp)), ("REPUTATION", str(rep)), ("DAY STREAK", str(streak))]
+        col2 = [("MESSAGES", str(total)), ("RANK", rankname), ("QUESTS", str(quests_total(chat_id, user_id)))]
         for i, (label, val) in enumerate(col1):
-            yy = y0 + i * 70
-            d.text((48, yy), label, font=_card_font(18, False), fill=grey)
+            yy = y0 + i * 72
+            d.text((48, yy), label, font=_card_font(16, False), fill=gold)
             d.text((48, yy + 24), val, font=_card_font(30, True), fill=white)
         for i, (label, val) in enumerate(col2):
-            yy = y0 + i * 70
-            d.text((480, yy), label, font=_card_font(18, False), fill=grey)
+            yy = y0 + i * 72
+            d.text((480, yy), label, font=_card_font(16, False), fill=gold)
             d.text((480, yy + 24), val, font=_card_font(30, True), fill=white)
         # разделитель колонок
-        d.line([450, y0, 450, y0 + 200], fill=(60, 55, 30), width=1)
+        d.line([450, y0, 450, y0 + 210], fill=(60, 55, 30), width=1)
         # подвал
-        d.text((40, H - 52), f"{CLAN_LINE}", font=_card_font(16, False), fill=grey)
-        d.text((W - 230, H - 52), today_str(), font=_card_font(16, False), fill=grey)
+        d.text((40, H - 50), "BRAWL STARS CLAN", font=_card_font(15, False), fill=grey)
+        d.text((W - 210, H - 50), today_str(), font=_card_font(15, False), fill=grey)
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         buf.seek(0)
