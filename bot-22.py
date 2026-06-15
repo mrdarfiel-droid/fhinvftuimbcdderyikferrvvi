@@ -1059,14 +1059,26 @@ def season_days_left():
 
 
 def log_error(place, err):
-    """5.4: журнал ошибок бота — пишем в БД, чтобы баги не терялись. Смотреть: команда .ошибки"""
+    """5.4: журнал ошибок бота — пишем в БД, чтобы баги не терялись. Смотреть: команда .ошибки
+    6.0: добавляем место в коде (строку) из трейсбэка — баги ловятся мгновенно."""
+    loc = ""
+    try:
+        import traceback
+        tb = getattr(err, "__traceback__", None)
+        if tb:
+            frames = traceback.extract_tb(tb)
+            if frames:
+                last = frames[-1]
+                loc = f" @{last.name}:{last.lineno}"
+    except Exception:
+        pass
     try:
         conn.execute("INSERT INTO errors (ts, place, text) VALUES (?,?,?)",
-                     (msk_now().isoformat(), str(place)[:60], str(err)[:500]))
+                     (msk_now().isoformat(), str(place)[:60], (str(err) + loc)[:500]))
         conn.commit()
     except Exception:
         pass
-    print(f"[ОШИБКА] {place}: {err}", flush=True)
+    print(f"[ОШИБКА] {place}: {err}{loc}", flush=True)
 
 
 def errors_on(day):
@@ -1337,7 +1349,7 @@ async def clan_members_fetch():
     if not tag:
         return None, "тег клана не задан — укажи через .клантег"
     bad = [c for c in tag if c not in _TAG_ALPHABET]
-    url = f"{BRAWL_API_BASE}/clans/%23{tag}/members"
+    url = f"{BRAWL_API_BASE}/clubs/%23{tag}/members"   # Brawl Stars API: клуб = /clubs/ (НЕ /clans/!)
     headers = {"Authorization": f"Bearer {BRAWL_API_KEY}", "Accept": "application/json"}
     try:
         async with httpx.AsyncClient(timeout=20) as client:
@@ -3710,9 +3722,11 @@ async def owner_command(update, context, first, parts):
 
 async def private_router(update, context):
     user = update.effective_user
-    if not user:
+    if not user or not update.message:
         return
     text = (update.message.text or "").strip()
+    if not text:
+        return
     # В личке команды тоже с точкой. Запоминаем, была ли она, и срезаем.
     had_dot = bool(CMD_PREFIX) and len(text) > 1 and text.startswith(CMD_PREFIX) and not text.startswith(CMD_PREFIX * 2)
     if had_dot:
@@ -4193,7 +4207,7 @@ async def handle_triggers(update, context, text, low, parts):
                 parse_mode=ParseMode.HTML)
             return True
         # собрать пары поле-значение из «сырых» слов после цели
-        raw = update.message.text.split()
+        raw = (update.message.text or "").split()
         # выкинем команду и токен-цель (@ник или это reply)
         toks = raw[1:]
         if toks and toks[0].startswith("@"):
@@ -5722,7 +5736,7 @@ async def ai_ask(update, context, question):
         f"Не используй markdown-звёздочки. Если вопрос не по теме клана или игры — всё равно помоги корректно и кратко."
     )
     key = (update.effective_chat.id, update.effective_user.id)
-    history = _ai_memory.get(key, [])
+    history = list(_ai_memory.get(key, []))   # 6.0: гарантируем list (защита от «list + tuple»)
     answer = await ai_complete(system, question, history=history)
     if not answer:
         # AI не ответил — не штрафуем полным кулдауном, разрешаем повтор через AI_RETRY_SEC
