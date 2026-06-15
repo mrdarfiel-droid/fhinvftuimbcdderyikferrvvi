@@ -148,10 +148,10 @@ def quiz_catline(diff, cat):
     """6.0: строка категории вопроса вида «🟢 Лёгкий · Бойцы»."""
     em, nm = QUIZ_DIFFICULTY.get(diff or 2, ("🟡", "Средний"))
     return f"{em} {nm} · {cat}"
-QUIZ_COOLDOWN_MIN = 90       # 5.9: пауза между викторинами в чате (90 мин — событие, не гринд-ферма)
-QUIZ_DAILY_LIMIT = 8         # 5.9: максимум викторин в чате за день (страховка от гринда)
-_quiz_day_count = {}         # "chat:day" -> сколько викторин сегодня
-_quiz_last = {}              # chat_id -> время последней викторины (для КД)
+QUIZ_COOLDOWN_SEC = 300      # 6.0: личная пауза между викторинами у игрока (5 мин — анти-спам, других не блокирует)
+QUIZ_DAILY_LIMIT = 8         # 6.0: викторин на игрока в день (анти-инфляция титулов — топ-титул копится ~2-3 недели)
+_quiz_day_count = {}         # "chat:user:day" -> сколько викторин сыграл игрок сегодня
+_quiz_last = {}              # (chat_id, user_id) -> время последней викторины игрока (для личного КД)
 # Каталог ежедневных квестов: (код, описание, цель). Прогресс считается из реальных событий дня.
 DAILY_QUESTS = [
     ("msg30",  "Напиши 30 сообщений в чате", 30),
@@ -4455,23 +4455,25 @@ async def handle_triggers(update, context, text, low, parts):
         if update.effective_chat.type not in ("group", "supergroup"):
             await update.message.reply_text(f"{pe('note')} Викторина — только в чате клана.", parse_mode=ParseMode.HTML)
             return True
-        # 5.9: КД между викторинами + дневной лимит (владелец — без ограничений)
+        # 6.0: КД и дневной лимит ПЕРСОНАЛЬНЫЕ (у каждого игрока свои; владелец — без ограничений)
         if not is_owner(me.id):
-            last = _quiz_last.get(cid, 0)
-            left = QUIZ_COOLDOWN_MIN * 60 - (time.time() - last)
+            ukey = (cid, me.id)
+            last = _quiz_last.get(ukey, 0)
+            left = QUIZ_COOLDOWN_SEC - (time.time() - last)
             if left > 0:
+                when = f"{int(left) + 1} сек" if left < 60 else f"{int(left // 60) + 1} мин"
                 await update.message.reply_text(
-                    f"{pe('clock')} Викторина недавно была. Следующую можно через <b>{int(left // 60) + 1} мин</b>.",
+                    f"{pe('clock')} Ты недавно играл. Следующая викторина для тебя через <b>{when}</b>.",
                     parse_mode=ParseMode.HTML)
                 return True
-            dkey = f"{cid}:{today_str()}"
+            dkey = f"{cid}:{me.id}:{today_str()}"
             if _quiz_day_count.get(dkey, 0) >= QUIZ_DAILY_LIMIT:
                 await update.message.reply_text(
-                    f"{pe('note')} На сегодня викторин хватит ({QUIZ_DAILY_LIMIT}/день). Возвращайтесь завтра!",
+                    f"{pe('note')} На сегодня викторин хватит ({QUIZ_DAILY_LIMIT}/день). Возвращайся завтра!",
                     parse_mode=ParseMode.HTML)
                 return True
             _quiz_day_count[dkey] = _quiz_day_count.get(dkey, 0) + 1
-        _quiz_last[cid] = time.time()
+        _quiz_last[(cid, me.id)] = time.time()
         ensure_user(cid, me)
         qid, q = _quiz_pick(cid, me.id)
         _quiz_mark_seen(cid, me.id, qid)   # 6.0: помечаем сразу, чтобы не повторялся
