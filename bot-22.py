@@ -260,6 +260,7 @@ ADMIN_DM_COMMANDS = {
     "отчётмесяц", "отчетмесяц", "monthlyreport", "месячныйотчет",
     "дайджест", "digest", "сводка",
     "сверка", "состав", "привязки", "roster", "tags",
+    "клантег", "clantag", "тегклана", "settag",
 }
 
 # 5.7: штабные команды, чьё сообщение бот удаляет сразу после вызова (чат остаётся чистым,
@@ -1317,25 +1318,43 @@ async def brawl_fetch(tag):
     return None
 
 
+def clan_tag_current():
+    """6.0: текущий тег клана — заданный командой (в meta) или дефолтный CLAN_TAG."""
+    saved = meta_get("clan_tag")
+    return (saved or CLAN_TAG or "").upper().lstrip("#")
+
+
+# допустимые символы тегов Supercell (НЕТ букв O, I — только 0; помогает поймать опечатку)
+_TAG_ALPHABET = set("0289PYLQGRJCUV")
+
+
 async def clan_members_fetch():
-    """6.0: список участников клана из API (теги в верхнем регистре без #). None при ошибке/без тега/ключа."""
-    if not BRAWL_API_KEY or not CLAN_TAG:
-        return None
-    url = f"{BRAWL_API_BASE}/clans/%23{CLAN_TAG}/members"
+    """6.0: состав клана из API. Возвращает (members|None, error_str|None).
+    Диагностика: различает нет ключа / неверный тег (404) / отклонён ключ / сеть."""
+    if not BRAWL_API_KEY:
+        return None, "не задан ключ Brawl Stars API (BRAWL_API_KEY)"
+    tag = clan_tag_current()
+    if not tag:
+        return None, "тег клана не задан — укажи через .клантег"
+    bad = [c for c in tag if c not in _TAG_ALPHABET]
+    url = f"{BRAWL_API_BASE}/clans/%23{tag}/members"
     headers = {"Authorization": f"Bearer {BRAWL_API_KEY}", "Accept": "application/json"}
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.get(url, headers=headers)
         if r.status_code == 200:
             data = r.json()
-            out = []
-            for m in data.get("items", []):
-                out.append({"tag": (m.get("tag") or "").upper().lstrip("#"), "name": m.get("name", "")})
-            return out
-        print(f"[CLAN] HTTP {r.status_code} для клана #{CLAN_TAG}", flush=True)
+            out = [{"tag": (m.get("tag") or "").upper().lstrip("#"), "name": m.get("name", "")}
+                   for m in data.get("items", [])]
+            return out, None
+        if r.status_code == 404:
+            hint = f" Подозрительные символы в теге: {' '.join(bad)} (буква O в тегах не бывает — это цифра 0)." if bad else ""
+            return None, f"клан с тегом #{tag} не найден (404).{hint} Проверь тег и задай заново через .клантег"
+        if r.status_code in (401, 403):
+            return None, f"ключ API отклонён (HTTP {r.status_code}) — проверь BRAWL_API_KEY"
+        return None, f"API вернул HTTP {r.status_code}"
     except Exception as e:
-        print(f"[CLAN] ошибка запроса: {e}", flush=True)
-    return None
+        return None, f"ошибка сети: {e}"
 
 
 # ===== 5.6 «РАЗВЕДКА»: ранговый режим Brawl Stars (ОФИЦИАЛЬНО — карта подтверждена боем 12.06.2026) =====
@@ -3517,17 +3536,30 @@ async def owner_command(update, context, first, parts):
             mkey = (now.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
         await update.message.reply_text(build_monthly_report(ALLOWED_CHAT_ID, mkey), parse_mode=ParseMode.HTML)
         return True
-    if first in ("сверка", "состав", "привязки", "roster", "tags"):
-        if not CLAN_TAG:
+    if first in ("клантег", "clantag", "тегклана", "settag"):
+        arg = parts[1] if len(parts) > 1 else ""
+        if not arg:
+            cur = clan_tag_current()
             await update.message.reply_text(
-                f"{pe('note')} Тег клана не задан. Чтобы включить сверку, добавь переменную окружения "
-                f"<code>CLAN_TAG</code> (тег клана из игры) на хостинге.", parse_mode=ParseMode.HTML)
+                f"{pe('note')} Текущий тег клана: <b>#{cur or '— не задан'}</b>\n"
+                f"Задать новый: <code>.клантег #ТВОЙТЕГ</code> (скопируй точь-в-точь из игры).",
+                parse_mode=ParseMode.HTML)
             return True
+        tag = arg.upper().lstrip("#").replace("О", "0").replace("O", "0")   # частая опечатка: буква О → ноль
+        bad = [c for c in tag if c not in _TAG_ALPHABET]
+        meta_set("clan_tag", tag)
+        warn = f"\n{pe('warn')} Подозрительные символы: {' '.join(bad)} — в тегах их не бывает, перепроверь." if bad else ""
+        await update.message.reply_text(
+            f"{pe('check')} Тег клана сохранён: <b>#{tag}</b>{warn}\nТеперь запусти <code>.сверка</code>.",
+            parse_mode=ParseMode.HTML)
+        return True
+
+    if first in ("сверка", "состав", "привязки", "roster", "tags"):
         await update.message.reply_text(f"{pe('clock')} Сверяю состав клана с чатом…", parse_mode=ParseMode.HTML)
-        members = await clan_members_fetch()
-        if members is None:
+        members, err = await clan_members_fetch()
+        if err:
             await update.message.reply_text(
-                f"{pe('cross')} Не удалось получить состав клана (проверь CLAN_TAG и ключ API).", parse_mode=ParseMode.HTML)
+                f"{pe('cross')} Сверка не удалась: {esc(err)}", parse_mode=ParseMode.HTML)
             return True
         cid = ALLOWED_CHAT_ID
         # карта тег→игрок из чата
