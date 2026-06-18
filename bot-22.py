@@ -149,7 +149,9 @@ def quiz_catline(diff, cat):
     em, nm = QUIZ_DIFFICULTY.get(diff or 2, ("🟡", "Средний"))
     return f"{em} {nm} · {cat}"
 QUIZ_COOLDOWN_SEC = 300      # 6.0: личная пауза между викторинами у игрока (5 мин — анти-спам, других не блокирует)
+QUIZ_COOLDOWN_VIP_SEC = 120  # 6.0: для VIP пауза короче (2 мин), но НЕ нулевая — без жульничества
 QUIZ_DAILY_LIMIT = 8         # 6.0: викторин на игрока в день (анти-инфляция титулов — топ-титул копится ~2-3 недели)
+QUIZ_VIP_DAILY_EXTRA = 4     # 6.0: VIP получает больше игр в день (+4 к лимиту)
 _quiz_day_count = {}         # "chat:user:day" -> сколько викторин сыграл игрок сегодня
 _quiz_last = {}              # (chat_id, user_id) -> время последней викторины игрока (для личного КД)
 _cmd_topic_notified = set()  # 6.0: кому уже показали подсказку про топик команд (чтобы не спамить)
@@ -285,6 +287,7 @@ GATED_COMMANDS = {
 ADMIN_DM_COMMANDS = {
     "bonusall", "lpall", "грантвсем", "всемлп", "backup", "бэкап", "бекап",
     "розыгрыш", "giveaway", "раздача", "draw",
+    "вип", "vip", "выдатьвип", "givevip", "забратьвип", "снятьвип", "removevip", "вип-",
     "modlog", "log", "журнал", "analytics", "dashboard", "аналитика", "статклан",
     "checknorms", "проверканорм", "snapshotnorms", "снимокнорм", "месяцнормы", "monthnorms",
     "пранкменю", "prankmenu",
@@ -319,6 +322,7 @@ STAFF_AUTODELETE_COMMANDS = {
 STAFF_DM_FEEDBACK_COMMANDS = {
     "lp", "лп", "rep", "реп", "репутация",
     "пранк", "prank", "задать", "set",
+    "вип", "vip", "выдатьвип", "givevip", "забратьвип", "снятьвип", "removevip", "вип-",
     "bonusall", "бонусвсем",
     "форсквест", "forcequest", "квестдать", "завершитьквест",
     "удалить", "remove", "delete", "del", "kickdb",
@@ -429,6 +433,9 @@ RELEASE_DATE = "13.06.2026"
 # Формат: (версия, тип, [пункты])
 CHANGELOG_HISTORY = [
     ("6.0", "Империя", [
+        "⚖️ Экономика сбалансирована: цены в магазине снижены, чтобы LP было приятно тратить (VIP — 500, щит — 300, ивент — 350, титул — 250, попытки — 75).",
+        "⭐ <b>VIP теперь с плюшками!</b> +50% LP за сообщения, +2 попытки викторины в день, значок ⭐ в профиле и топах, и <b>богатая золотая карточка</b> <code>.card</code>. Загляни: <code>.shop</code> → «Про VIP».",
+        "🛒 <b>Новое в магазине за LP!</b> Теперь LP есть куда тратить: ⭐ VIP-статус, 🛡️ щит от нормы (спасает от штрафа!), 🎯 доп. попытки викторины, 🎉 право на ивент и 🎭 свой титул. Загляни: <code>.shop</code>.",
         "🎖️ <b>Клановые звания!</b> Теперь за накопленные LP ты растёшь в званиях: 🥉 Рекрут → 🎽 Боец → ⚔️ Ветеран → 🛡️ Элита → 🔥 Мастер → 💎 Чемпион → 👑 Легенда LINKOR. Это престиж навсегда — трата LP звание НЕ понижает. Смотри: <code>.p</code>.",
         "🎉 <b>Право провести ивент за LP!</b> В магазине можно купить право запустить «Час репутации» (x2 респекты для всех). Подними движ сам! <code>.shop</code>.",
         "🎊 Новые ивенты: 💛 Час репутации (x2 респекты), 🧠 Викторина-марафон (без задержки), а также 🔥 x2/⚡ x3 LP. Когда идёт ивент — лови момент!",
@@ -761,6 +768,10 @@ def init_db():
     _add_col("users", "lp", "INTEGER DEFAULT 0")
     _add_col("users", "lp_earned", "INTEGER DEFAULT 0")   # 6.0: всего заработано LP за всё время (для клановых званий; трата не уменьшает)
     _add_col("users", "event_tickets", "INTEGER DEFAULT 0")  # 6.0: билеты «право провести ивент» (покупаются за LP)
+    _add_col("users", "vip_until", "TEXT")                 # 6.0: VIP-статус активен до (ISO-дата)
+    _add_col("users", "norm_shield", "INTEGER DEFAULT 0")  # 6.0: щиты от штрафа за норму (покупаются за LP)
+    _add_col("users", "quiz_bonus_day", "TEXT")           # 6.0: день (YYYY-MM-DD) действия бонуса попыток викторины
+    _add_col("users", "quiz_bonus_left", "INTEGER DEFAULT 0")  # 6.0: доп. попытки викторины на сегодня
     _add_col("users", "norm_week", "TEXT")
     _add_col("users", "super_week", "TEXT")
     _add_col("users", "earn_week", "TEXT")
@@ -1373,12 +1384,12 @@ def _days_word(n):
 # (порог LP, название звания, краткое описание)
 CLAN_RANKS = [
     (0,     "🥉 Рекрут",          "новичок клана"),
-    (500,   "🎽 Боец",            "влился в строй"),
-    (1500,  "⚔️ Ветеран",         "проверен боями"),
-    (3500,  "🛡️ Элита",           "опора клана"),
-    (7000,  "🔥 Мастер",          "сила и стабильность"),
-    (12000, "💎 Чемпион клана",    "вершина мастерства"),
-    (20000, "👑 Легенда LINKOR",  "имя в истории клана"),
+    (300,   "🎽 Боец",            "влился в строй"),
+    (1000,  "⚔️ Ветеран",         "проверен боями"),
+    (2500,  "🛡️ Элита",           "опора клана"),
+    (5000,  "🔥 Мастер",          "сила и стабильность"),
+    (8500,  "💎 Чемпион клана",    "вершина мастерства"),
+    (14000, "👑 Легенда LINKOR",  "имя в истории клана"),
 ]
 
 
@@ -1407,6 +1418,46 @@ def user_lp_earned(chat_id, user_id):
     return row["e"] if row else 0
 
 
+VIP_DISCOUNT = 0.20          # 6.0: скидка VIP на покупки за LP (20%)
+VIP_FOREVER = "2099-12-31T00:00:00+03:00"   # 6.0: дата для «бессрочного» VIP (с таймзоной МСК)
+
+
+def vip_active(row):
+    """6.0: активен ли VIP-статус. Владелец — всегда VIP. Иначе по дате vip_until."""
+    try:
+        uid = row["user_id"] if "user_id" in row.keys() else None
+    except Exception:
+        uid = None
+    if uid == LEADER_ID:
+        return True
+    try:
+        u = row["vip_until"] if "vip_until" in row.keys() else None
+    except Exception:
+        u = None
+    if not u:
+        return False
+    try:
+        dt_until = datetime.fromisoformat(u)
+        now = msk_now()
+        # выравниваем таймзоны (старые записи могли быть без offset)
+        if dt_until.tzinfo is None:
+            dt_until = dt_until.replace(tzinfo=now.tzinfo)
+        return dt_until > now
+    except Exception:
+        return False
+
+
+def use_norm_shield(chat_id, user_id):
+    """6.0: если у участника есть щит от нормы — списать один и вернуть True (штраф отменяется)."""
+    row = conn.execute("SELECT COALESCE(norm_shield,0) AS s FROM users WHERE chat_id=? AND user_id=?",
+                       (chat_id, user_id)).fetchone()
+    if row and row["s"] > 0:
+        conn.execute("UPDATE users SET norm_shield=norm_shield-1 WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+        conn.commit()
+        return True
+    return False
+
+
 # Вехи прогресс-бара (по логике покупки, а не по цене): сначала Brawl Pass.
 # «Улучшение до BP+» не веха — это докупка к уже имеющемуся Brawl Pass.
 STORE_REWARDS = [(850, "Brawl Pass"), (1650, "Brawl Pass Plus"), (2800, "Pro Pass")]
@@ -1414,8 +1465,11 @@ STORE_REWARDS = [(850, "Brawl Pass"), (1650, "Brawl Pass Plus"), (2800, "Pro Pas
 # Товары за LP — ТОЛЬКО внутриклановые (Brawl Pass/пассы за LP больше не продаются; их можно купить за рубли).
 # (ключ, название, цена в LP, имя премиум-эмодзи).
 STORE_ITEMS = [
-    ("event", "Право провести ивент «Час репутации»", 2000, "contest"),
-    ("title", "Свой титул в профиле (30 дней)", 1000, "role"),
+    ("vip", "⭐ VIP-статус (30 дней)", 500, "star"),
+    ("event", "Право провести ивент «Час репутации»", 350, "contest"),
+    ("normpass", "🛡️ Щит от нормы (1 неделя)", 300, "shield"),
+    ("title", "Свой титул в профиле (30 дней)", 250, "role"),
+    ("quizboost", "🎯 +5 попыток викторины сегодня", 75, "game"),
 ]
 STORE_ITEMS_BY_KEY = {k: (k, n, p, e) for (k, n, p, e) in STORE_ITEMS}
 # Пассы за РУБЛИ (их участники покупают за свои деньги — раздел «За рубли»). За LP НЕ продаются.
@@ -2233,13 +2287,22 @@ def render_profile_card(chat_id, user_id, display_name):
             return None
         SS = 2                       # суперсэмплинг для гладкости
         W, H = 900 * SS, 540 * SS
+        is_vip = vip_active(row)     # 6.0: VIP — улучшенная богатая карточка
         gold = (216, 178, 72)
         gold_lt = (244, 220, 140)
         gold_dk = (74, 64, 32)
         white = (240, 242, 248)
         grey = (148, 154, 168)
-        c_top = (26, 31, 46)
-        c_bot = (12, 14, 21)
+        if is_vip:
+            # богаче: ярче золото, тёплый тёмный фон с лёгким коричнево-золотым оттенком
+            gold = (240, 200, 92)
+            gold_lt = (255, 233, 168)
+            gold_dk = (104, 84, 40)
+            c_top = (40, 34, 26)
+            c_bot = (16, 13, 9)
+        else:
+            c_top = (26, 31, 46)
+            c_bot = (12, 14, 21)
         img = Image.new("RGB", (W, H), c_bot)
         d = ImageDraw.Draw(img)
 
@@ -2251,9 +2314,29 @@ def render_profile_card(chat_id, user_id, display_name):
             t = y / H
             col = tuple(int(c_top[k] * (1 - t) + c_bot[k] * t) for k in range(3))
             d.rectangle([0, y, W, y + 2 * SS], fill=col)
+        # 6.0 VIP: радиальное золотое свечение в левом-верхнем углу (за именем)
+        if is_vip:
+            import math as _m
+            gx, gy = PX_GLOW = (180 * SS, 90 * SS)
+            for rr in range(260 * SS, 0, -6 * SS):
+                a = max(0, 1 - rr / (260 * SS)) * 0.16
+                col = tuple(int(c_top[k] * (1 - a) + gold_lt[k] * a) for k in range(3))
+                d.ellipse([gx - rr, gy - rr, gx + rr, gy + rr], fill=col)
         # рамка
-        d.rectangle([6 * SS, 6 * SS, W - 7 * SS, H - 7 * SS], outline=gold, width=3 * SS)
-        d.rectangle([14 * SS, 14 * SS, W - 15 * SS, H - 15 * SS], outline=gold_dk, width=1 * SS)
+        if is_vip:
+            # богатая тройная окантовка
+            d.rectangle([4 * SS, 4 * SS, W - 5 * SS, H - 5 * SS], outline=gold, width=4 * SS)
+            d.rectangle([12 * SS, 12 * SS, W - 13 * SS, H - 13 * SS], outline=gold_lt, width=2 * SS)
+            d.rectangle([18 * SS, 18 * SS, W - 19 * SS, H - 19 * SS], outline=gold_dk, width=1 * SS)
+            # угловые акценты (золотые уголки)
+            cl = 40 * SS
+            for (ox, oy, dx, dy) in [(4*SS, 4*SS, 1, 1), (W-5*SS, 4*SS, -1, 1),
+                                     (4*SS, H-5*SS, 1, -1), (W-5*SS, H-5*SS, -1, -1)]:
+                d.line([ox, oy, ox + dx * cl, oy], fill=gold_lt, width=5 * SS)
+                d.line([ox, oy, ox, oy + dy * cl], fill=gold_lt, width=5 * SS)
+        else:
+            d.rectangle([6 * SS, 6 * SS, W - 7 * SS, H - 7 * SS], outline=gold, width=3 * SS)
+            d.rectangle([14 * SS, 14 * SS, W - 15 * SS, H - 15 * SS], outline=gold_dk, width=1 * SS)
         # левый акцент-бар
         d.rectangle([14 * SS, 14 * SS, 26 * SS, H - 15 * SS], fill=gold)
 
@@ -2261,12 +2344,24 @@ def render_profile_card(chat_id, user_id, display_name):
         # шапка: звезда + LINKOR
         _draw_star(d, PX + 16 * SS, 56 * SS, 22 * SS, 9 * SS, gold)
         d.text((PX + 44 * SS, 32 * SS), CLAN_NAME.upper(), font=F(34, True), fill=gold)
-        d.text((PX + 46 * SS, 78 * SS), "PROFILE CARD", font=F(15, False), fill=grey)
+        d.text((PX + 46 * SS, 78 * SS), "VIP PROFILE CARD" if is_vip else "PROFILE CARD", font=F(15, False),
+               fill=gold_lt if is_vip else grey)
+        # 6.0 VIP: золотой бейдж «★ VIP» в правом верхнем углу шапки
+        if is_vip:
+            vtext = "VIP"
+            vb = d.textbbox((0, 0), vtext, font=F(20, True))
+            vw = (vb[2] - vb[0]) + 64 * SS
+            vx2 = W - 40 * SS
+            vx1 = vx2 - vw
+            d.rounded_rectangle([vx1, 30 * SS, vx2, 74 * SS], radius=12 * SS, fill=gold)
+            d.rounded_rectangle([vx1, 30 * SS, vx2, 74 * SS], radius=12 * SS, outline=gold_lt, width=2 * SS)
+            _draw_star(d, vx1 + 22 * SS, 52 * SS, 13 * SS, 5 * SS, (30, 24, 12))
+            d.text((vx1 + 38 * SS, 40 * SS), vtext, font=F(20, True), fill=(30, 24, 12))
         d.line([PX, 116 * SS, W - 40 * SS, 116 * SS], fill=gold_dk, width=2 * SS)
 
         # имя (без эмодзи, транслит при отсутствии шрифта)
         name = _ct(_strip_emoji(display_name))[:24] or "Игрок"
-        d.text((PX, 134 * SS), name, font=F(40, True), fill=white)
+        d.text((PX, 134 * SS), name, font=F(40, True), fill=gold_lt if is_vip else white)
         # титул (чистим эмодзи)
         et = active_title(row) or (row["earned_title"] if "earned_title" in row.keys() else None)
         et_clean = _ct(_strip_emoji(str(et))) if et else ""
@@ -2353,9 +2448,10 @@ async def show_profile(update, context, user):
     if WEEKLY_MSG_NORM > 0 and today_str() >= NORMS_START_DATE:
         wk = stat_week(chat_id, user.id)
         week_line += f" / норма {WEEKLY_MSG_NORM} {pe('check') if wk >= WEEKLY_MSG_NORM else pe('cross')}"
+    vip_badge = " ⭐<b>VIP</b>" if (vip_active(row) and disp_rank is None) else ""
     text = (
         f"{pe('person')} <b>ПРОФИЛЬ {CLAN_NAME}</b>\n{CLAN_LINE}\n"
-        f"{esc(disp_name_full)}{uname}{title_line}\n\n"
+        f"{esc(disp_name_full)}{uname}{vip_badge}{title_line}\n\n"
         f"<blockquote>{pe('role')} Роль: <b>{role_disp}</b>\n"
         f"{pe('crown')} Звание: <b>{clan_rank_for(row['lp_earned'] if 'lp_earned' in row.keys() else 0)[0]}</b>\n"
         f"{pe('lp')} LP: <b>{fmt_lp(disp_lp)}</b> / {LP_MAX}\n"
@@ -2534,6 +2630,14 @@ async def show_top(update, context, args):
                 f"{pe('game')} Пока ни у кого не привязан тег или нет данных по кубкам. Привяжите тег: <code>.tag #ТЕГ</code>.",
                 parse_mode=ParseMode.HTML)
         return await update.message.reply_text("Пока нет данных для этого топа.")
+    # 6.0: имена активных VIP — для значка ⭐ в топе
+    _vip_names = set()
+    try:
+        for vr in conn.execute("SELECT name, vip_until FROM users WHERE chat_id=? AND vip_until IS NOT NULL", (chat_id,)).fetchall():
+            if vip_active(vr):
+                _vip_names.add(vr["name"])
+    except Exception:
+        pass
     lines = [f"{pe('cup')} <b>ТОП {CLAN_NAME} — {label}</b>\n"]
     for i, r in enumerate(rows):
         if cat == "lp":
@@ -2543,7 +2647,8 @@ async def show_top(update, context, args):
         else:
             val = int(r["val"])
         marker = medals.get(i) or f"{pe('star')}"
-        lines.append(f"<b>{i+1}.</b> {marker} {esc(r['name'])} — <b>{val}</b>{unit}")
+        vip_mark = " ⭐" if r["name"] in _vip_names else ""
+        lines.append(f"<b>{i+1}.</b> {marker} {esc(r['name'])}{vip_mark} — <b>{val}</b>{unit}")
     if cat == "trophies":
         lines.append(f"\n<i>Кубки обновляются, когда игрок привязывает тег командой</i> <code>.tag #ТЕГ</code>")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
@@ -2681,7 +2786,8 @@ def store_menu_keyboard(owner_id):
         [InlineKeyboardButton("💰 Как получать LP", callback_data=f"store:earn:{u}"),
          InlineKeyboardButton("💎 За рубли", callback_data=f"store:rubles:{u}")],
         [InlineKeyboardButton("🎖️ Клановые звания", callback_data=f"store:ranks:{u}"),
-         InlineKeyboardButton("📜 Правила STORE", callback_data=f"store:rules:{u}")],
+         InlineKeyboardButton("⭐ Про VIP", callback_data=f"store:vipinfo:{u}")],
+        [InlineKeyboardButton("📜 Правила STORE", callback_data=f"store:rules:{u}")],
     ]
     for key, name, price, _e in STORE_ITEMS:
         rows.append([InlineKeyboardButton(f"{name} — {price} LP", callback_data=f"buy:{key}")])
@@ -2691,10 +2797,10 @@ def store_menu_keyboard(owner_id):
 def _store_intro():
     return (f"{pe('shop')} <b>{CLAN_NAME} STORE</b>\n{CLAN_LINE}\n"
             f"<i>Внутренний магазин клана. LP зарабатываются только активностью.</i>\n"
-            f"{pe('crown')} <b>Главное:</b> копи LP — расти в <b>клановых званиях</b> (престиж навсегда, трата их не сбрасывает).\n"
-            f"{pe('contest')} За LP можно купить: <b>право провести ивент</b> и <b>свой титул</b>.\n"
-            f"{pe('lp')} Brawl Pass и гемы — теперь только <b>за рубли</b> (раздел ниже), за LP не продаются.\n"
-            f"<i>Разделы ниже — нажми, чтобы узнать подробнее.</i>")
+            f"{pe('crown')} Копи LP — расти в <b>клановых званиях</b> (престиж навсегда).\n"
+            f"{pe('shop')} <b>За LP можно купить:</b> ⭐ VIP-статус · 🛡️ щит от нормы · 🎉 право на ивент · 🎭 свой титул · 🎯 попытки викторины.\n"
+            f"{pe('lp')} Brawl Pass и гемы — за рубли у менеджера (раздел ниже).\n"
+            f"<i>Нажми товар, чтобы купить. Разделы ниже — подробнее.</i>")
 
 
 def _store_section(key):
@@ -2707,6 +2813,17 @@ def _store_section(key):
                 f"{pe('hug')} Помощь, медийность, сложные задачи — на усмотрение администрации\n"
                 f"<i>LP нельзя купить, подарить или вывести — только заработать. В играх (лотерея, дуэли) "
                 f"LP не передаются напрямую, а часть всегда сгорает в казну.</i></blockquote>")
+    if key == "vipinfo":
+        return (f"{pe('star')} <b>VIP-статус (30 дней)</b>\n<blockquote expandable>"
+                f"VIP — это престиж и реальные плюшки:\n"
+                f"⭐ <b>Значок VIP</b> в профиле и в топах клана\n"
+                f"💰 <b>+50% LP</b> за каждое сообщение в чате\n"
+                f"🛒 <b>−{int(VIP_DISCOUNT*100)}% скидка</b> на все покупки за LP\n"
+                f"🎯 <b>+{QUIZ_VIP_DAILY_EXTRA} игры викторины</b> в день и <b>короче пауза</b> между вопросами ({QUIZ_COOLDOWN_VIP_SEC // 60} мин вместо {QUIZ_COOLDOWN_SEC // 60})\n"
+                f"🎁 <b>Приоритет в розыгрышах</b> (выше шанс выиграть)\n"
+                f"🖼️ <b>Богатая золотая карточка</b> профиля (<code>.card</code>)\n\n"
+                f"Покупается за LP, действует 30 дней (можно продлевать). "
+                f"Администрация может выдать VIP на любой срок.</blockquote>")
     if key == "ranks":
         lines = [f"{pe('crown')} <b>Клановые звания</b>", "<blockquote expandable>",
                  "Звание растёт по <b>накопленному за всё время LP</b> (трата LP его НЕ понижает). "
@@ -3560,7 +3677,10 @@ async def on_action_callback(update, context):
             return await cq.answer("🛡️ Администраторы вне экономики не покупают.", show_alert=True)
         ensure_user(chat_id, user)
         # 6.0: ВНУТРИКЛАНОВЫЕ товары за LP — мгновенно, без заявки менеджеру
-        if _k in ("event", "title"):
+        if _k in ("event", "title", "vip", "normpass", "quizboost"):
+            # 6.0: VIP-скидка на внутриклановые покупки
+            if vip_active(get_user(chat_id, user.id) or {}):
+                price = max(1, int(round(price * (1 - VIP_DISCOUNT))))
             bal0 = (get_user(chat_id, user.id) or {})["lp"]
             if bal0 < price:
                 return await cq.answer(f"Недостаточно LP. Нужно ещё {fmt_lp(price - bal0)}.", show_alert=True)
@@ -3574,6 +3694,38 @@ async def on_action_callback(update, context):
                     f"{pe('contest')} <b>{esc(user.full_name)}</b> купил <b>право провести ивент</b>! "
                     f"Запусти «Час репутации» (x2 респекты для всего клана) командой <code>.ивент rep</code> 💛",
                     parse_mode=ParseMode.HTML)
+            elif _k == "vip":
+                add_lp(chat_id, user.id, -price)
+                cur = get_user(chat_id, user.id)
+                base = msk_now()
+                try:
+                    if cur and cur["vip_until"] and datetime.fromisoformat(cur["vip_until"]) > base:
+                        base = datetime.fromisoformat(cur["vip_until"])   # продлеваем
+                except Exception:
+                    pass
+                conn.execute("UPDATE users SET vip_until=? WHERE chat_id=? AND user_id=?",
+                             ((base + timedelta(days=30)).isoformat(), chat_id, user.id))
+                conn.commit()
+                await cq.answer("⭐ VIP-статус активирован на 30 дней!", show_alert=True)
+                await cq.message.reply_text(
+                    f"{pe('star')} <b>{esc(user.full_name)}</b> теперь <b>⭐ VIP</b> клана на 30 дней! Статус виден в профиле.",
+                    parse_mode=ParseMode.HTML)
+            elif _k == "normpass":
+                add_lp(chat_id, user.id, -price)
+                conn.execute("UPDATE users SET norm_shield=COALESCE(norm_shield,0)+1 WHERE chat_id=? AND user_id=?",
+                             (chat_id, user.id))
+                conn.commit()
+                cnt = (get_user(chat_id, user.id) or {})["norm_shield"]
+                await cq.answer(f"🛡️ Щит от нормы куплен! У тебя щитов: {cnt}", show_alert=True)
+            elif _k == "quizboost":
+                today = today_str()
+                cur = get_user(chat_id, user.id)
+                have = (cur["quiz_bonus_left"] or 0) if (cur and cur["quiz_bonus_day"] == today) else 0
+                add_lp(chat_id, user.id, -price)
+                conn.execute("UPDATE users SET quiz_bonus_day=?, quiz_bonus_left=? WHERE chat_id=? AND user_id=?",
+                             (today, have + 5, chat_id, user.id))
+                conn.commit()
+                await cq.answer("🎯 +5 попыток викторины на сегодня!", show_alert=True)
             else:  # title
                 await cq.answer("Напиши свой титул командой: .title buy ТЕКСТ", show_alert=True)
             return
@@ -3988,6 +4140,54 @@ async def owner_command(update, context, first, parts):
                 f"Повтор <b>обнулит прирост кубков</b> у всех. Если точно нужно: <code>.снимокнорм заново</code>.",
                 parse_mode=ParseMode.HTML)
         return True
+    if first in ("вип", "vip", "выдатьвип", "givevip"):
+        tgt = await read_target(update, context, parts)
+        if tgt in (False, None):
+            await update.message.reply_text(
+                f"{pe('star')} <b>Выдать VIP</b>\n{CLAN_LINE}\n"
+                f"<blockquote>Ответом на сообщение или с @ником:\n"
+                f"<code>.вип @ник 7</code> — VIP на 7 дней (1–30)\n"
+                f"<code>.вип @ник</code> — VIP <b>навсегда</b>\n"
+                f"<code>.забратьвип @ник</code> — снять VIP</blockquote>", parse_mode=ParseMode.HTML)
+            return True
+        ensure_user(ALLOWED_CHAT_ID, tgt)
+        days = next((int(p) for p in parts[1:] if p.isdigit()), None)
+        perma = days is None or any(p.lower() in ("навсегда", "вечно", "perm", "forever", "∞") for p in parts[1:])
+        if perma:
+            until = VIP_FOREVER
+            human = "навсегда"
+        else:
+            days = max(1, min(30, days))
+            until = (msk_now() + timedelta(days=days)).isoformat()
+            human = f"на {days} {_days_word(days)}"
+        conn.execute("UPDATE users SET vip_until=? WHERE chat_id=? AND user_id=?",
+                     (until, ALLOWED_CHAT_ID, tgt.id))
+        conn.commit()
+        await update.message.reply_text(
+            f"{pe('check')} <b>{esc(tgt.full_name)}</b> получил ⭐ VIP <b>{human}</b>.", parse_mode=ParseMode.HTML)
+        # поздравим участника в чате (приятно + видно клану)
+        try:
+            await context.bot.send_message(
+                ALLOWED_CHAT_ID,
+                f"{pe('star')} <b>{esc(tgt.full_name)}</b> теперь <b>⭐ VIP</b> клана {CLAN_NAME} {human}! Поздравляем 🎉",
+                parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        return True
+
+    if first in ("забратьвип", "снятьвип", "removevip", "вип-"):
+        tgt = await read_target(update, context, parts)
+        if tgt in (False, None):
+            await update.message.reply_text(
+                f"{pe('note')} Кому снять VIP? Ответь на сообщение или укажи @ник: <code>.забратьвип @ник</code>.",
+                parse_mode=ParseMode.HTML)
+            return True
+        conn.execute("UPDATE users SET vip_until=NULL WHERE chat_id=? AND user_id=?", (ALLOWED_CHAT_ID, tgt.id))
+        conn.commit()
+        await update.message.reply_text(
+            f"{pe('check')} У <b>{esc(tgt.full_name)}</b> снят VIP-статус.", parse_mode=ParseMode.HTML)
+        return True
+
     if first in ("розыгрыш", "giveaway", "раздача", "draw"):
         # .розыгрыш [кол-во победителей] [сумма LP каждому] [дней активности]
         nums = [int(p) for p in parts[1:] if p.lstrip("-").isdigit()]
@@ -4005,7 +4205,21 @@ async def owner_command(update, context, first, parts):
                 parse_mode=ParseMode.HTML)
             return True
         import random as _rnd
-        winners = _rnd.sample(pool, min(winners_n, len(pool)))
+        # 6.0: VIP имеют приоритет — больший вес в розыгрыше (x2)
+        weighted = []
+        for m in pool:
+            mrow = get_user(ALLOWED_CHAT_ID, m["user_id"])
+            w = 2 if (mrow and vip_active(mrow)) else 1
+            weighted.extend([m] * w)
+        winners = []
+        chosen_ids = set()
+        _rnd.shuffle(weighted)
+        for m in weighted:
+            if m["user_id"] not in chosen_ids:
+                winners.append(m)
+                chosen_ids.add(m["user_id"])
+            if len(winners) >= min(winners_n, len(pool)):
+                break
         for w in winners:
             add_lp(ALLOWED_CHAT_ID, w["user_id"], prize)
         win_lines = "\n".join(
@@ -4834,11 +5048,14 @@ async def handle_triggers(update, context, text, low, parts):
         if update.effective_chat.type not in ("group", "supergroup"):
             await update.message.reply_text(f"{pe('note')} Викторина — только в чате клана.", parse_mode=ParseMode.HTML)
             return True
-        # 6.0: КД и дневной лимит ПЕРСОНАЛЬНЫЕ (у каждого игрока свои; владелец и ивент-марафон — без КД)
+        # 6.0: КД и дневной лимит ПЕРСОНАЛЬНЫЕ. VIP — КОРОЧЕ КД (не нулевой, без жульничества) и больше игр.
         if not is_owner(me.id) and not quiz_rush_active():
+            _qb = get_user(cid, me.id)
+            is_vip_user = vip_active(_qb)
+            cd = QUIZ_COOLDOWN_VIP_SEC if is_vip_user else QUIZ_COOLDOWN_SEC
             ukey = (cid, me.id)
             last = _quiz_last.get(ukey, 0)
-            left = QUIZ_COOLDOWN_SEC - (time.time() - last)
+            left = cd - (time.time() - last)
             if left > 0:
                 when = f"{int(left) + 1} сек" if left < 60 else f"{int(left // 60) + 1} мин"
                 await update.message.reply_text(
@@ -4846,9 +5063,13 @@ async def handle_triggers(update, context, text, low, parts):
                     parse_mode=ParseMode.HTML)
                 return True
             dkey = f"{cid}:{me.id}:{today_str()}"
-            if _quiz_day_count.get(dkey, 0) >= QUIZ_DAILY_LIMIT:
+            bonus_today = (_qb["quiz_bonus_left"] or 0) if (_qb and _qb["quiz_bonus_day"] == today_str()) else 0
+            vip_extra = QUIZ_VIP_DAILY_EXTRA if is_vip_user else 0   # 6.0: VIP больше игр в день
+            limit_today = QUIZ_DAILY_LIMIT + bonus_today + vip_extra
+            if _quiz_day_count.get(dkey, 0) >= limit_today:
                 await update.message.reply_text(
-                    f"{pe('note')} На сегодня викторин хватит ({QUIZ_DAILY_LIMIT}/день). Возвращайся завтра!",
+                    f"{pe('note')} На сегодня викторин хватит ({limit_today}/день). "
+                    f"Можно докупить попытки в магазине: <code>.shop</code> 🎯",
                     parse_mode=ParseMode.HTML)
                 return True
             _quiz_day_count[dkey] = _quiz_day_count.get(dkey, 0) + 1
@@ -6899,6 +7120,7 @@ async def run_norm_check(context, chat_id, announce=True):
         if r["norm_anchor_week"] != monday:
             continue                                       # вступил в середине недели / не был на старте — пропуск
         failed_any = False
+        shield_used = False   # 6.0: один щит от нормы покрывает всю неделю
         cups_ok_flag, msg_ok_flag = None, 0
         # --- НОРМА КУБКОВ (только у привязанных со снимком этой недели) ---
         if r["brawl_tag"] and r["trophy_base_week"] == monday and r["trophy_base"] is not None:
@@ -6916,9 +7138,13 @@ async def run_norm_check(context, chat_id, announce=True):
                     cup_failed.append((nm, gain, 0))
                 else:
                     cups_ok_flag = 0
-                    add_lp(chat_id, uid, -NORM_FAIL_PENALTY)
-                    failed_any = True
-                    cup_failed.append((nm, gain, None))
+                    if shield_used or use_norm_shield(chat_id, uid):
+                        shield_used = True
+                        cup_failed.append((nm, gain, "shield"))
+                    else:
+                        add_lp(chat_id, uid, -NORM_FAIL_PENALTY)
+                        failed_any = True
+                        cup_failed.append((nm, gain, None))
         # --- НОРМА АКТИВНОСТИ (у всех присутствовавших на старте недели) ---
         msgs = stat_week(chat_id, uid)
         if msgs >= WEEKLY_MSG_NORM:
@@ -6927,9 +7153,13 @@ async def run_norm_check(context, chat_id, announce=True):
         elif soft:
             act_failed.append((nm, msgs))
         else:
-            add_lp(chat_id, uid, -NORM_FAIL_PENALTY)
-            failed_any = True
-            act_failed.append((nm, msgs))
+            if shield_used or use_norm_shield(chat_id, uid):
+                shield_used = True
+                act_failed.append((nm, msgs))
+            else:
+                add_lp(chat_id, uid, -NORM_FAIL_PENALTY)
+                failed_any = True
+                act_failed.append((nm, msgs))
         # 5.8: фиксируем результат недели для месячной выплаты (кубки начисляются раз в месяц)
         conn.execute(
             "INSERT INTO norm_weeks (chat_id, user_id, week, cups_ok, msg_ok) VALUES (?,?,?,?,?) "
@@ -7649,7 +7879,9 @@ async def counter(update, context):
             _last_sender[chat_id] = [user.id, 1]
             ls = _last_sender[chat_id]
         if not is_cmd and stat_today(chat_id, user.id) <= MSG_DAILY_CAP and ls[1] <= SELF_SPAM_LIMIT:
-            add_lp(chat_id, user.id, round(LP_PER_MESSAGE * event_multiplier(), 3))   # 6.0: x2/x3 во время ивента
+            _vrow = get_user(chat_id, user.id)
+            vip_mult = 1.5 if vip_active(_vrow) else 1.0   # 6.0: VIP +50% LP за сообщения
+            add_lp(chat_id, user.id, round(LP_PER_MESSAGE * event_multiplier() * vip_mult, 3))
     except Exception:
         pass
     # 6.0: публичные анонсы повышений в звании (накопились при начислениях LP где угодно)
@@ -7895,7 +8127,7 @@ def _help_section(key):
                 "<b>AI-сводка:</b> <code>.дайджест</code> — AI-сводка тем чата <i>(только темы, без имён и цитат)</i>\n\n"
                 "<b>Сверка клана:</b> <code>.сверка</code> — кто привязал тег и в клане, кто нет (с упоминаниями) · "
                 "<code>.клантег #ТЕГ</code> — задать тег клуба из игры\n\n"
-                "<b>Экономика/нормы:</b> <code>.bonusall 150</code> — выдать всем LP · <code>.розыгрыш 2 150 7</code> — разыграть LP среди активных · <code>.checknorms</code> · "
+                "<b>Экономика/нормы:</b> <code>.bonusall 150</code> — выдать всем LP · <code>.розыгрыш 2 150 7</code> — разыграть LP среди активных · <code>.вип @ник 7</code> — выдать VIP (или навсегда без числа) · <code>.забратьвип @ник</code> · <code>.checknorms</code> · "
                 "<code>.месяцнормы</code> — выплата норм за месяц · <code>.snapshotnorms</code> · "
                 "<code>.нормы тест</code> / <code>.нормы снимок</code> — обкатка проверки норм · "
                 "<code>.отпуск @юзер 1–30</code> — освободить от норм · "
